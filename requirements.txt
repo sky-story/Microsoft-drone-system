@@ -1,0 +1,18 @@
+# ANAFI Ai 无人机控制 + 目标检测 依赖
+
+# Parrot Olympe SDK (需要单独安装，参见 Parrot 官方文档)
+# pip3 install parrot-olympe
+
+# OpenCV
+opencv-python>=4.5.0
+
+# YOLOv8 (Ultralytics)
+ultralytics>=8.0.0
+
+# 其他依赖 (ultralytics 会自动安装，这里列出主要的)
+numpy>=1.20.0
+torch>=1.8.0
+torchvision>=0.9.0
+
+# 可选：CUDA 加速 (如果有 NVIDIA GPU)
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118

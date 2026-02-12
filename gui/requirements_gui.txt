@@ -1,0 +1,26 @@
+# 无人机综合控制系统 GUI 依赖
+
+# Web 框架
+flask==3.0.0
+flask-socketio==5.3.5
+python-socketio==5.10.0
+
+# Web 服务器
+python-engineio==4.8.0
+werkzeug==3.0.1
+
+# 计算机视觉
+opencv-python==4.8.1.78
+numpy==1.24.3
+
+# 网络请求
+requests==2.31.0
+
+# 无人机 SDK
+# olympe==7.7.0  # 需要从 Parrot 官方获取
+
+# 可选：视频编码
+# Pillow==10.1.0
+
+# 可选：更好的日志
+# colorlog==6.8.0

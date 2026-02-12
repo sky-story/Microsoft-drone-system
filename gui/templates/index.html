@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drone Control System</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=8">
+    <!-- Vue.js served locally (no CDN dependency) -->
+    <script src="/static/js/vue.global.js"></script>
+    <style>
+        /* Hide Vue template content until Vue mounts (prevent flash of raw template) */
+        [v-cloak] { display: none !important; }
+    </style>
+</head>
+<body>
+    {% raw %}
+    <div id="app" v-cloak>
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="logo">
+                    <span class="logo-icon">🚁</span>
+                    Drone Control System
+                </h1>
+                <div class="header-status">
+                    <div class="status-item" :class="{'status-online': drone.connected}">
+                        <span class="status-dot"></span>
+                        <span v-if="drone.connected">Connected</span>
+                        <span v-else>Disconnected</span>
+                    </div>
+                    <div class="status-item battery" v-if="drone.connected">
+                        <span class="battery-icon">🔋</span>
+                        <span>{{ Math.round(drone.battery) }}%</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Emergency Stop - Always Visible -->
+        <button class="emergency-stop-fab" @click="emergencyStop" title="Emergency Stop">
+            <span class="fab-icon">🚨</span>
+            <span class="fab-text">STOP</span>
+        </button>
+
+        <!-- Main Container -->
+        <main class="main-container">
+            <!-- Left Panel: Control Tabs -->
+            <div class="control-panel">
+                <!-- Tab Navigation -->
+                <div class="tabs">
+                    <button 
+                        class="tab-btn" 
+                        :class="{active: activeTab === 'basic'}"
+                        @click="activeTab = 'basic'">
+                        🎮 Basic Control
+                    </button>
+                    <button 
+                        class="tab-btn" 
+                        :class="{active: activeTab === 'navigation'}"
+                        @click="activeTab = 'navigation'">
+                        🧭 Navigation
+                    </button>
+                    <button 
+                        class="tab-btn" 
+                        :class="{active: activeTab === 'perception'}"
+                        @click="activeTab = 'perception'">
+                        👁️ Perception
+                    </button>
+                    <button 
+                        class="tab-btn" 
+                        :class="{active: activeTab === 'winch'}"
+                        @click="activeTab = 'winch'">
+                        ⚙️ Winch System
+                    </button>
+                </div>
+
+                <!-- Tab Content -->
+                <div class="tab-content">
+                    <!-- Basic Control Tab -->
+                    <div v-show="activeTab === 'basic'" class="tab-pane">
+                        <div class="button-grid">
+                            <button class="btn btn-primary" @click="connectDrone" :disabled="drone.connected || connectBusy">
+                                <span v-if="connectBusy">Connecting...</span>
+                                <span v-else>Connect</span>
+                            </button>
+                            <button class="btn btn-secondary" @click="disconnectDrone" :disabled="!drone.connected || connectBusy">
+                                Disconnect
+                            </button>
+                            <button class="btn" 
+                                    :class="drone.flying ? 'btn-warning' : 'btn-success'" 
+                                    @click="toggleFlight" 
+                                    :disabled="!drone.connected || flightBusy">
+                                <span v-if="flightBusy">{{ drone.flying ? 'Landing...' : 'Taking off...' }}</span>
+                                <span v-else-if="drone.flying">Land</span>
+                                <span v-else>Take Off</span>
+                            </button>
+                        </div>
+                        
+                        <!-- Manual Control -->
+                        <div class="manual-control" v-if="drone.connected && drone.flying">
+                            <h3>Manual Control</h3>
+                            <div class="control-pad">
+                                <!-- Vertical Controls (Altitude) -->
+                                <div class="vertical-controls">
+                                    <button class="control-btn" 
+                                            @mousedown="startManualControl('gaz', 50)"
+                                            @mouseup="stopManualControl"
+                                            @mouseleave="stopManualControl">
+                                        ⬆️<br><span class="small">Up</span>
+                                    </button>
+                                    <button class="control-btn" 
+                                            @mousedown="startManualControl('gaz', -50)"
+                                            @mouseup="stopManualControl"
+                                            @mouseleave="stopManualControl">
+                                        ⬇️<br><span class="small">Down</span>
+                                    </button>
+                                </div>
+                                
+                                <!-- Directional Controls -->
+                                <div class="directional-controls">
+                                    <div class="control-row">
+                                        <button class="control-btn" 
+                                                @mousedown="startManualControl('pitch', 50)"
+                                                @mouseup="stopManualControl"
+                                                @mouseleave="stopManualControl">
+                                            ⬆️<br><span class="small">Forward</span>
+                                        </button>
+                                    </div>
+                                    <div class="control-row">
+                                        <button class="control-btn" 
+                                                @mousedown="startManualControl('roll', -50)"
+                                                @mouseup="stopManualControl"
+                                                @mouseleave="stopManualControl">
+                                            ⬅️<br><span class="small">Left</span>
+                                        </button>
+                                        <div class="control-center">🚁</div>
+                                        <button class="control-btn" 
+                                                @mousedown="startManualControl('roll', 50)"
+                                                @mouseup="stopManualControl"
+                                                @mouseleave="stopManualControl">
+                                            ➡️<br><span class="small">Right</span>
+                                        </button>
+                                    </div>
+                                    <div class="control-row">
+                                        <button class="control-btn" 
+                                                @mousedown="startManualControl('pitch', -50)"
+                                                @mouseup="stopManualControl"
+                                                @mouseleave="stopManualControl">
+                                            ⬇️<br><span class="small">Backward</span>
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                <!-- Rotation Controls -->
+                                <div class="rotation-controls">
+                                    <button class="control-btn" 
+                                            @mousedown="startManualControl('yaw', -50)"
+                                            @mouseup="stopManualControl"
+                                            @mouseleave="stopManualControl">
+                                        ↺<br><span class="small">Left</span>
+                                    </button>
+                                    <button class="control-btn" 
+                                            @mousedown="startManualControl('yaw', 50)"
+                                            @mouseup="stopManualControl"
+                                            @mouseleave="stopManualControl">
+                                        ↻<br><span class="small">Right</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <p class="control-hint">Hold buttons to control drone movement</p>
+                        </div>
+                        
+                        <div class="drone-info" v-if="drone.connected">
+                            <h3>Drone Status</h3>
+                            <div class="info-row">
+                                <span class="info-label">Flight Status:</span>
+                                <span class="info-value" :class="{'text-success': drone.flying}">
+                                    <span v-if="drone.flying">Flying</span>
+                                    <span v-else>Grounded</span>
+                                </span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">GPS Satellites:</span>
+                                <span class="info-value">{{ drone.satellites }}</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Position:</span>
+                                <span class="info-value small">
+                                    {{ drone.latitude.toFixed(6) }}, {{ drone.longitude.toFixed(6) }}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Navigation Tab -->
+                    <div v-show="activeTab === 'navigation'" class="tab-pane">
+                        <h3>GPS Navigation</h3>
+                        <span class="status-badge" :class="getStatusClass(navigation.state)">
+                            {{ getStatusText(navigation.state) }}
+                        </span>
+                        
+                        <div class="form-group">
+                            <label>Target Latitude</label>
+                            <input type="number" v-model.number="navConfig.target_lat" step="0.000001" 
+                                   :disabled="navigation.state === 'running'">
+                        </div>
+                        <div class="form-group">
+                            <label>Target Longitude</label>
+                            <input type="number" v-model.number="navConfig.target_lon" step="0.000001"
+                                   :disabled="navigation.state === 'running'">
+                        </div>
+                        <div class="form-group">
+                            <label>Altitude (meters)</label>
+                            <input type="number" v-model.number="navConfig.target_alt" step="0.5" min="0.5" max="150"
+                                   :disabled="navigation.state === 'running'">
+                        </div>
+                        <div class="form-group">
+                            <label>Arrival Threshold (meters)</label>
+                            <input type="number" v-model.number="navConfig.arrival_threshold" step="0.1" min="0.1" max="10"
+                                   :disabled="navigation.state === 'running'">
+                        </div>
+                        
+                        <div class="button-grid-3">
+                            <button class="btn btn-primary" @click="startNavigation"
+                                    :disabled="!drone.connected || !drone.flying || navigation.state === 'running'">
+                                Start Navigation
+                            </button>
+                            <button class="btn btn-warning" @click="stopNavigation"
+                                    :disabled="navigation.state !== 'running'">
+                                Stop Navigation
+                            </button>
+                            <button class="btn btn-info" @click="testNavigation"
+                                    :disabled="!drone.connected">
+                                Test Module
+                            </button>
+                        </div>
+                        
+                        <div class="progress-info" v-if="navigation.state === 'running'">
+                            <div class="progress-bar">
+                                <div class="progress-fill" :style="{width: navigation.progress + '%'}"></div>
+                            </div>
+                            <p class="progress-text">{{ navigation.message }}</p>
+                            <p class="progress-text small">Distance: {{ navigation.current_distance.toFixed(1) }}m</p>
+                        </div>
+                    </div>
+
+                    <!-- Perception Tab -->
+                    <div v-show="activeTab === 'perception'" class="tab-pane">
+                        <h3>Object Tracking</h3>
+                        <span class="status-badge" :class="getStatusClass(perception.state)">
+                            {{ getStatusText(perception.state) }}
+                        </span>
+                        
+                        <div class="form-group">
+                            <label>Tracking Mode</label>
+                            <select v-model="perceptionConfig.mode" @change="updatePerceptionConfig">
+                                <option value="yolo">YOLO Detection</option>
+                                <option value="color">Color Detection</option>
+                            </select>
+                        </div>
+                        
+                        <div v-if="perceptionConfig.mode === 'yolo'">
+                            <div class="form-group">
+                                <label>Target Classes</label>
+                                <input type="text" v-model="perceptionConfig.classes_str" 
+                                       placeholder="e.g., person, car" @change="updatePerceptionConfig">
+                                <small>Comma-separated</small>
+                            </div>
+                        </div>
+                        
+                        <div v-if="perceptionConfig.mode === 'color'">
+                            <div class="form-group">
+                                <label>Target Color</label>
+                                <select v-model="perceptionConfig.color" @change="updatePerceptionConfig">
+                                    <option value="red">Red</option>
+                                    <option value="green">Green</option>
+                                    <option value="blue">Blue</option>
+                                    <option value="yellow">Yellow</option>
+                                    <option value="orange">Orange</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="button-grid-3">
+                            <button class="btn btn-success" @click="startPerception"
+                                    :disabled="!drone.connected || perception.state === 'running'">
+                                Start Tracking
+                            </button>
+                            <button class="btn btn-warning" @click="stopPerception"
+                                    :disabled="perception.state !== 'running'">
+                                Stop Tracking
+                            </button>
+                            <button class="btn btn-info" @click="testPerception"
+                                    :disabled="!drone.connected">
+                                Test Module
+                            </button>
+                        </div>
+                        
+                        <div class="tracking-info" v-if="perception.detected">
+                            <div class="info-row">
+                                <span class="info-label">Detection:</span>
+                                <span class="info-value" :class="{'text-success': perception.tracking}">
+                                    <span v-if="perception.tracking">Tracking</span>
+                                    <span v-else>Not Tracking</span>
+                                </span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Stability:</span>
+                                <span class="info-value" :class="{'text-success': perception.stable}">
+                                    <span v-if="perception.stable">Stable ✓</span>
+                                    <span v-else>Adjusting...</span>
+                                </span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Confidence:</span>
+                                <span class="info-value">{{ (perception.confidence * 100).toFixed(0) }}%</span>
+                            </div>
+                        </div>
+                        
+                        <p class="status-message">{{ perception.message }}</p>
+                    </div>
+
+                    <!-- Winch System Tab -->
+                    <div v-show="activeTab === 'winch'" class="tab-pane">
+                        <h3>Winch & Gripper System</h3>
+                        <span class="status-badge" :class="getStatusClass(winch.state)">
+                            {{ getStatusText(winch.state) }}
+                        </span>
+                        
+                        <div class="winch-status">
+                            <div class="status-indicator" :class="getWinchActionClass(winch.current_action)">
+                                <div class="status-icon">{{ getWinchIcon(winch.current_action) }}</div>
+                                <div class="status-text">{{ winch.current_action }}</div>
+                            </div>
+                            <p class="status-message">{{ winch.message }}</p>
+                        </div>
+                        
+                        <div class="info-box">
+                            <p>The winch system will be triggered automatically when the target is stable.</p>
+                            <p>Sequence: LOWER → PULL → STOP</p>
+                        </div>
+                        
+                        <button class="btn btn-info btn-block" @click="testWinch"
+                                style="margin-top: 1rem;">
+                            Test Winch System
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Video & Logs -->
+            <div class="display-panel">
+                <!-- Video Stream (MJPEG from drone camera) -->
+                <section class="card video-card">
+                    <div class="card-header">
+                        <h2>📹 Live Video</h2>
+                        <span class="video-status" v-if="drone.connected">● LIVE</span>
+                    </div>
+                    <div class="video-container">
+                        <!-- Use :src binding so browser only loads when Vue sets the value -->
+                        <img v-if="drone.connected" 
+                             :src="'/api/video_feed'" 
+                             alt="Drone Camera" 
+                             class="video-stream">
+                        <div v-else class="video-placeholder">
+                            <span class="placeholder-icon">📹</span>
+                            <p>Connect drone to view camera feed</p>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- System Logs -->
+                <section class="card logs-card">
+                    <div class="card-header">
+                        <h2>📋 System Logs</h2>
+                        <button class="btn btn-small" @click="clearLogs">Clear</button>
+                    </div>
+                    <div class="logs-container">
+                        <div class="log-entry" v-for="(log, index) in logs" :key="index" :class="'log-' + log.level">
+                            <span class="log-time">{{ log.time }}</span>
+                            <span class="log-level">{{ log.level.toUpperCase() }}</span>
+                            <span class="log-message">{{ log.message }}</span>
+                        </div>
+                        <div v-if="logs.length === 0" class="log-empty">No logs</div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+    {% endraw %}
+
+    <script src="/static/js/app.js?v=8"></script>
+</body>
+</html>
