@@ -16,10 +16,9 @@ ANAFI Ai: 目标跟踪 + 外部系统控制脚本 (WebSocket版本)
      - 发送 stop 命令 (停止外部系统)
   4. 完成后等待手动降落 (按 'l' 键降落)
 
-外部系统WebSocket控制命令:
-  - ws://192.168.42.15 → "lower:100" (下降100mm)
-  - ws://192.168.42.15 → "pull:50" (拉起50mm)
-  - ws://192.168.42.15 → "stop" (停止)
+外部系统 (见 external_systems.py，可扩展):
+  - Winch (默认 ws://192.168.42.15): lower:mm | pull:mm | stop
+  - Gripper (默认 ws://192.168.42.39:81): hold | release | grip | status
 
 使用方法:
   python fly_track_and_grab_ws.py --classes person
@@ -48,171 +47,17 @@ from olympe.messages.ardrone3.Piloting import TakeOff, Landing
 from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
 
 from object_detector import ObjectDetector, Detection
+from external_systems import (
+    WinchController,
+    GripperController,
+    ExternalSystemsManager,
+    GrabState,
+)
 
 import tty
 import termios
 import select
-import websocket
 import json
-
-
-class GrabState(Enum):
-    """外部系统控制状态"""
-    IDLE = "idle"                      # 空闲,未触发
-    TRACKING = "tracking"              # 正在跟踪,等待稳定
-    TRIGGERED = "triggered"            # 已触发,正在执行
-    LOWERING = "lowering"              # 正在下降
-    WAITING = "waiting"                # 等待中
-    PULLING = "pulling"                # 正在拉起
-    COMPLETED = "completed"            # 已完成
-    ERROR = "error"                    # 错误
-
-
-class ExternalSystemController:
-    """外部系统控制器 (通过WebSocket)"""
-    
-    def __init__(self, ws_url: str = "ws://192.168.42.15", timeout: float = 5.0, 
-                 lower_length: float = 100.0, pull_length: float = 50.0):
-        """
-        初始化WebSocket控制器
-        
-        Args:
-            ws_url: WebSocket服务器地址 (例如 ws://192.168.42.15)
-            timeout: 连接超时时间(秒)
-            lower_length: 下降长度(毫米)
-            pull_length: 拉起长度(毫米)
-        """
-        self.ws_url = ws_url
-        self.timeout = timeout
-        self.lower_length = lower_length
-        self.pull_length = pull_length
-        self.state = GrabState.IDLE
-        self.ws = None
-        self.connected = False
-        
-    def connect(self) -> bool:
-        """连接到WebSocket服务器"""
-        try:
-            print(f"[EXTERNAL] Connecting to WebSocket: {self.ws_url}")
-            self.ws = websocket.create_connection(self.ws_url, timeout=self.timeout)
-            self.connected = True
-            print(f"[EXTERNAL] ✓ WebSocket connected")
-            return True
-        except Exception as e:
-            print(f"[EXTERNAL] ✗ WebSocket connection failed: {e}")
-            self.connected = False
-            return False
-    
-    def disconnect(self):
-        """断开WebSocket连接"""
-        if self.ws:
-            try:
-                self.ws.close()
-                print("[EXTERNAL] WebSocket disconnected")
-            except Exception as e:
-                print(f"[WARN] WebSocket disconnect error: {e}")
-            finally:
-                self.ws = None
-                self.connected = False
-    
-    def send_command(self, command: str, length: float = 0) -> bool:
-        """
-        发送命令到外部系统
-        
-        Args:
-            command: "lower", "pull", "stop"
-            length: 长度参数(毫米), 仅用于 lower 和 pull 命令
-            
-        Returns:
-            True = 成功, False = 失败
-        """
-        # 如果未连接,尝试重连
-        if not self.connected or not self.ws:
-            if not self.connect():
-                return False
-        
-        # 构造命令字符串
-        if command == "stop":
-            cmd_str = "stop"
-        elif command == "lower":
-            cmd_str = f"lower:{int(length)}"
-        elif command == "pull":
-            cmd_str = f"pull:{int(length)}"
-        else:
-            print(f"[EXTERNAL] ✗ Unknown command: {command}")
-            return False
-        
-        try:
-            print(f"[EXTERNAL] Sending command: {cmd_str} -> {self.ws_url}")
-            self.ws.send(cmd_str)
-            
-            # 等待响应 (可选,根据服务器实现决定)
-            try:
-                response = self.ws.recv()
-                print(f"[EXTERNAL] ✓ {command.upper()} success: {response}")
-            except Exception:
-                # 如果服务器不返回响应,忽略超时错误
-                print(f"[EXTERNAL] ✓ {command.upper()} sent (no response)")
-            
-            return True
-                
-        except websocket.WebSocketConnectionClosedException:
-            print(f"[EXTERNAL] ✗ WebSocket connection closed, attempting reconnect...")
-            self.connected = False
-            if self.connect():
-                return self.send_command(command, length)
-            return False
-        except Exception as e:
-            print(f"[EXTERNAL] ✗ {command.upper()} error: {e}")
-            return False
-    
-    def execute_grab_sequence(self, wait_time: float = 5.0, pull_time: float = 3.0):
-        """
-        执行抓取序列:
-        1. LOWER (下降指定长度)
-        2. 等待 wait_time 秒
-        3. PULL (拉起指定长度)
-        4. 等待 pull_time 秒 (保持拉起状态)
-        5. STOP (停止)
-        6.lesCompleted
-        """
-        self.state = GrabState.TRIGGERED
-        
-        # 步骤 1: LOWER
-        self.state = GrabState.LOWERING
-        print(f"[EXTERNAL] Lowering {self.lower_length}mm...")
-        if not self.send_command("lower", self.lower_length):
-            self.state = GrabState.ERROR
-            return False
-        
-        # 步骤 2: 等待 (下降到位)
-        self.state = GrabState.WAITING
-        print(f"[EXTERNAL] Waiting {wait_time} seconds before pulling...")
-        time.sleep(wait_time)
-        
-        # 步骤 3: PULL
-        self.state = GrabState.PULLING
-        print(f"[EXTERNAL] Pulling {self.pull_length}mm...")
-        if not self.send_command("pull", self.pull_length):
-            self.state = GrabState.ERROR
-            return False
-        
-        # 步骤 4: 等待 (保持拉起状态)
-        print(f"[EXTERNAL] Holding pull for {pull_time} seconds...")
-        time.sleep(pull_time)
-        
-        # 步骤 5: STOP (停止外部系统)
-        print("[EXTERNAL] Sending STOP command...")
-        if not self.send_command("stop"):
-            print("[WARN] STOP command failed, but continuing...")
-        
-        self.state = GrabState.COMPLETED
-        print("[EXTERNAL] ✓ Grab sequence completed!")
-        return True
-    
-    def stop(self):
-        """停止外部系统"""
-        self.send_command("stop")
 
 
 class SafeTracker:
@@ -467,9 +312,13 @@ def parse_args():
     p.add_argument("--drone-ip", default=os.environ.get("DRONE_IP", "192.168.42.1"))
     p.add_argument("--loglevel", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     
-    # 外部系统
+    # 外部系统 (winch + 可选 gripper)
     p.add_argument("--system-url", default="ws://192.168.42.15",
-                   help="External system WebSocket URL (default: ws://192.168.42.15)")
+                   help="Winch WebSocket URL (default: ws://192.168.42.15)")
+    p.add_argument("--gripper-url", default="ws://192.168.42.39:81",
+                   help="Gripper WebSocket URL; cmds: hold | release | grip | status (default: ws://192.168.42.39:81)")
+    p.add_argument("--no-gripper", action="store_true",
+                   help="Disable gripper in grab sequence (winch only)")
     p.add_argument("--lower-length", type=float, default=100.0,
                    help="Lower distance in millimeters (default: 100mm)")
     p.add_argument("--pull-length", type=float, default=50.0,
@@ -526,11 +375,20 @@ class FlyTrackAndGrab:
         self.drone = olympe.Drone(args.drone_ip)
         self.detector = None
         self.tracker = None
-        self.external_system = ExternalSystemController(
+        # Modular external systems: winch + optional gripper
+        self.external_systems = ExternalSystemsManager()
+        winch = WinchController(
             ws_url=args.system_url,
             lower_length=args.lower_length,
-            pull_length=args.pull_length
+            pull_length=args.pull_length,
+            log_prefix="WINCH",
         )
+        self.external_systems.register("winch", winch)
+        self.external_system = winch  # backward compat: state + execute_grab_sequence
+        gripper = GripperController(ws_url=args.gripper_url, log_prefix="GRIPPER")
+        self.external_systems.register("gripper", gripper)
+        self.gripper = gripper
+        self.use_gripper_in_sequence = not args.no_gripper
         
         self.running = False
         self.paused = False
@@ -598,7 +456,7 @@ class FlyTrackAndGrab:
             invert_pitch=self.args.invert_pitch,
         )
         print(f"[OK] Tracker ready (max_speed={self.args.max_speed})")
-        print(f"[OK] External system: {self.args.system_url}")
+        print(f"[OK] Winch: {self.args.system_url}  Gripper: {self.args.gripper_url}")
         print(f"[OK] Auto-trigger: {self.args.auto_trigger}, stable time: {self.args.stable_time}s")
     
     def yuv_frame_cb(self, yuv_frame):
@@ -788,10 +646,10 @@ class FlyTrackAndGrab:
         print("🎯 TARGET LOCKED! Triggering grab sequence...")
         print("="*60)
         
-        # 在单独的线程中执行,避免阻塞主循环
+        gripper = self.gripper if self.use_gripper_in_sequence else None
         thread = threading.Thread(
             target=self.external_system.execute_grab_sequence,
-            args=(self.args.wait_time, self.args.pull_time),
+            kwargs={"gripper": gripper},
             daemon=True
         )
         thread.start()
@@ -1053,6 +911,19 @@ class FlyTrackAndGrab:
             self._update_manual_axis("gaz", self.manual_speed)
         elif ch in ('f', 'F'):
             self._update_manual_axis("gaz", -self.manual_speed)
+        # 手动 gripper 控制 (1=hold 2=release 3=grip 4=status)
+        elif ch == '1':
+            print("[GRIPPER] hold")
+            self.gripper.hold()
+        elif ch == '2':
+            print("[GRIPPER] release")
+            self.gripper.release()
+        elif ch == '3':
+            print("[GRIPPER] grip")
+            self.gripper.grip()
+        elif ch == '4':
+            st = self.gripper.status()
+            print(f"[GRIPPER] status: {st}")
         
         return False
     
@@ -1064,7 +935,8 @@ class FlyTrackAndGrab:
         print("=" * 75)
         print()
         print(f"  Tracking: {self.args.classes}")
-        print(f"  External system (WebSocket): {self.args.system_url}")
+        print(f"  Winch (WebSocket): {self.args.system_url}")
+        print(f"  Gripper (WebSocket): {self.args.gripper_url}  (in sequence: {'yes' if self.use_gripper_in_sequence else 'no (--no-gripper)'})")
         print(f"  Lower length: {self.args.lower_length}mm")
         print(f"  Pull length: {self.args.pull_length}mm")
         print(f"  Auto-trigger: {self.args.auto_trigger}")
@@ -1082,12 +954,12 @@ class FlyTrackAndGrab:
         print("  Workflow:")
         print("    1. Takeoff and search for target")
         print("    2. Track target until stable")
-        print("    3. Trigger grab sequence (WebSocket):")
-        print(f"       • LOWER {self.args.lower_length}mm (下降)")
-        print(f"       • Wait {self.args.wait_time}s (等待到位)")
-        print(f"       • PULL {self.args.pull_length}mm (拉起)")
-        print(f"       • Hold {self.args.pull_time}s (保持)")
-        print(f"       • STOP (停止)")
+        print("    3. Trigger grab sequence (each step waits for ok; winch waits for ok: done):")
+        if self.use_gripper_in_sequence:
+            print("       • Gripper RELEASE → ok → Winch LOWER → ok → ok: done → Gripper GRIP → ok → Winch PULL → ok → ok: done")
+        else:
+            print("       • Winch LOWER → ok → ok: done → Winch PULL → ok → ok: done")
+        print(f"       • Lower: {self.args.lower_length}mm, Pull: {self.args.pull_length}mm")
         print("    4. Hover and wait for manual landing (press 'l')")
         if self.args.auto_land_on_exit:
             print("       ⚠️  Auto-land ENABLED (--auto-land-on-exit)")
@@ -1108,6 +980,7 @@ class FlyTrackAndGrab:
         print("  ───────────────")
         print("  t = takeoff  |  p = pause/resume  |  q = quit")
         print("  g = manual grab (trigger grab when target detected)")
+        print("  1/2/3/4 = gripper: hold / release / grip / status")
         print()
         print("  MANUAL FLIGHT (works ANYTIME, overrides auto-tracking):")
         print("  ────────────────────────────────────────────────────────")
@@ -1268,15 +1141,13 @@ def main():
         except Exception:
             pass
         
-        # 停止外部系统
+        # 停止外部系统并断开所有 WebSocket
         try:
             app.external_system.stop()
         except Exception:
             pass
-        
-        # 断开WebSocket连接
         try:
-            app.external_system.disconnect()
+            app.external_systems.disconnect_all()
         except Exception:
             pass
         
