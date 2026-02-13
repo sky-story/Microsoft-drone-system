@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Drone Control System</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=8">
+    <title>Seahawks - Drone Control</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=14">
     <!-- Vue.js served locally (no CDN dependency) -->
     <script src="/static/js/vue.global.js"></script>
     <style>
@@ -18,10 +18,13 @@
         <!-- Header -->
         <header class="header">
             <div class="header-content">
-                <h1 class="logo">
-                    <span class="logo-icon">🚁</span>
-                    Drone Control System
-                </h1>
+                <div class="logo">
+                    <img src="/static/img/logo.png" alt="Seahawks" class="logo-img">
+                    <div class="logo-titles">
+                        <span class="logo-team">SEAHAWKS</span>
+                        <span class="logo-subtitle">Drone Control</span>
+                    </div>
+                </div>
                 <div class="header-status">
                     <div class="status-item" :class="{'status-online': drone.connected}">
                         <span class="status-dot"></span>
@@ -52,25 +55,25 @@
                         class="tab-btn" 
                         :class="{active: activeTab === 'basic'}"
                         @click="activeTab = 'basic'">
-                        🎮 Basic Control
+                        Basic Control
                     </button>
                     <button 
                         class="tab-btn" 
                         :class="{active: activeTab === 'navigation'}"
                         @click="activeTab = 'navigation'">
-                        🧭 Navigation
+                        Navigation
                     </button>
                     <button 
                         class="tab-btn" 
                         :class="{active: activeTab === 'perception'}"
                         @click="activeTab = 'perception'">
-                        👁️ Perception
+                        Perception
                     </button>
                     <button 
                         class="tab-btn" 
                         :class="{active: activeTab === 'winch'}"
                         @click="activeTab = 'winch'">
-                        ⚙️ Winch System
+                        Winch System
                     </button>
                 </div>
 
@@ -199,15 +202,61 @@
                             {{ getStatusText(navigation.state) }}
                         </span>
                         
+                        <!-- Saved Locations -->
+                        <div class="saved-locations-section">
+                            <label>Saved Locations</label>
+                            <div class="saved-locations-row">
+                                <select v-model.number="selectedLocationIdx" class="location-select"
+                                        :disabled="navigation.state === 'running'">
+                                    <option :value="-1" disabled>-- Select a saved location --</option>
+                                    <option v-for="(loc, idx) in savedLocations" :key="idx" :value="idx">
+                                        {{ loc.name }} ({{ loc.lat }}, {{ loc.lon }})
+                                    </option>
+                                </select>
+                                <button class="btn btn-sm btn-primary" @click="selectLocation"
+                                        :disabled="selectedLocationIdx < 0 || navigation.state === 'running'"
+                                        title="Load selected location">
+                                    Load
+                                </button>
+                                <button class="btn btn-sm btn-danger" @click="deleteSelectedLocation"
+                                        :disabled="selectedLocationIdx < 0 || navigation.state === 'running'"
+                                        title="Delete selected location">
+                                    ✕
+                                </button>
+                            </div>
+                            <div class="saved-locations-row" style="margin-top: 6px;">
+                                <input type="text" v-model="newLocationName" class="location-name-input"
+                                       placeholder="Location name..."
+                                       :disabled="navigation.state === 'running'"
+                                       @keyup.enter="saveCurrentLocation">
+                                <button class="btn btn-sm btn-success" @click="saveCurrentLocation"
+                                        :disabled="navigation.state === 'running'"
+                                        title="Save current coordinates as a named location">
+                                    Save
+                                </button>
+                                <button class="btn btn-sm btn-info" @click="saveCurrentPositionAsLocation"
+                                        :disabled="!drone.connected || !drone.latitude"
+                                        title="Save drone's current GPS position">
+                                    📍
+                                </button>
+                            </div>
+                        </div>
+                        
                         <div class="form-group">
                             <label>Target Latitude</label>
-                            <input type="number" v-model.number="navConfig.target_lat" step="0.000001" 
-                                   :disabled="navigation.state === 'running'">
+                            <input type="text" inputmode="decimal"
+                                   :value="navConfig.target_lat"
+                                   @input="navConfig.target_lat = parseFloat($event.target.value) || 0"
+                                   :disabled="navigation.state === 'running'"
+                                   placeholder="e.g. 47.621843">
                         </div>
                         <div class="form-group">
                             <label>Target Longitude</label>
-                            <input type="number" v-model.number="navConfig.target_lon" step="0.000001"
-                                   :disabled="navigation.state === 'running'">
+                            <input type="text" inputmode="decimal"
+                                   :value="navConfig.target_lon"
+                                   @input="navConfig.target_lon = parseFloat($event.target.value) || 0"
+                                   :disabled="navigation.state === 'running'"
+                                   placeholder="e.g. -122.176913">
                         </div>
                         <div class="form-group">
                             <label>Altitude (meters)</label>
@@ -235,12 +284,17 @@
                             </button>
                         </div>
                         
-                        <div class="progress-info" v-if="navigation.state === 'running'">
+                        <div class="progress-info" v-if="navigation.state === 'running' || navigation.state === 'completed' || navigation.state === 'error'">
                             <div class="progress-bar">
-                                <div class="progress-fill" :style="{width: navigation.progress + '%'}"></div>
+                                <div class="progress-fill" :style="{width: navigation.progress + '%'}"
+                                     :class="{'bg-success': navigation.state === 'completed', 'bg-error': navigation.state === 'error'}"></div>
                             </div>
-                            <p class="progress-text">{{ navigation.message }}</p>
-                            <p class="progress-text small">Distance: {{ navigation.current_distance.toFixed(1) }}m</p>
+                            <p class="progress-text" :class="{'text-success': navigation.state === 'completed', 'text-error': navigation.state === 'error'}">
+                                {{ navigation.message }}
+                            </p>
+                            <p class="progress-text small" v-if="navigation.current_distance > 0">
+                                Distance: {{ navigation.current_distance.toFixed(1) }}m
+                            </p>
                         </div>
                     </div>
 
@@ -389,6 +443,6 @@
     </div>
     {% endraw %}
 
-    <script src="/static/js/app.js?v=8"></script>
+    <script src="/static/js/app.js?v=14"></script>
 </body>
 </html>

@@ -32,8 +32,8 @@ createApp({
             
             // Navigation config
             navConfig: {
-                target_lat: 47.6218425,
-                target_lon: -122.1769126,
+                target_lat: 47.6217966,
+                target_lon: -122.1784220,
                 target_alt: 2.0,
                 arrival_threshold: 0.5
             },
@@ -76,13 +76,19 @@ createApp({
             
             // Button busy locks (prevent double-click)
             flightBusy: false,
-            connectBusy: false
+            connectBusy: false,
+            
+            // Saved GPS locations
+            savedLocations: [],
+            newLocationName: '',
+            selectedLocationIdx: -1
         };
     },
     
     mounted() {
         // Start polling status every 500ms (no SocketIO needed)
         this.startPolling();
+        this.loadSavedLocations();
         this.addLog('GUI loaded, polling started', 'info');
     },
     
@@ -284,10 +290,100 @@ createApp({
             await this.apiCall('/api/emergency_stop');
         },
         
+        // ========== Saved Locations ==========
+        
+        loadSavedLocations() {
+            try {
+                const data = localStorage.getItem('drone_saved_locations');
+                if (data) {
+                    this.savedLocations = JSON.parse(data);
+                } else {
+                    // Default preset locations
+                    this.savedLocations = [
+                        { name: 'GIX Building', lat: 47.6218425, lon: -122.1769126, alt: 2.0 }
+                    ];
+                    this.persistLocations();
+                }
+            } catch (e) {
+                this.savedLocations = [];
+            }
+        },
+        
+        persistLocations() {
+            localStorage.setItem('drone_saved_locations', JSON.stringify(this.savedLocations));
+        },
+        
+        saveCurrentLocation() {
+            const name = this.newLocationName.trim();
+            if (!name) {
+                this.addLog('Please enter a name for this location', 'warning');
+                return;
+            }
+            const lat = parseFloat(this.navConfig.target_lat);
+            const lon = parseFloat(this.navConfig.target_lon);
+            const alt = parseFloat(this.navConfig.target_alt) || 2.0;
+            if (isNaN(lat) || isNaN(lon)) {
+                this.addLog('Please enter valid coordinates first', 'warning');
+                return;
+            }
+            const entry = { name: name, lat: lat, lon: lon, alt: alt };
+            // Check duplicate name
+            const exists = this.savedLocations.findIndex(loc => loc.name === name);
+            if (exists >= 0) {
+                this.savedLocations[exists] = entry;
+                this.addLog(`Updated: ${name} → (${lat}, ${lon}), alt=${alt}m`, 'info');
+            } else {
+                this.savedLocations.push(entry);
+                this.addLog(`Saved: ${name} → (${lat}, ${lon}), alt=${alt}m`, 'success');
+            }
+            this.persistLocations();
+            this.newLocationName = '';
+        },
+        
+        selectLocation() {
+            const idx = this.selectedLocationIdx;
+            if (idx < 0 || idx >= this.savedLocations.length) return;
+            const loc = this.savedLocations[idx];
+            this.navConfig.target_lat = loc.lat;
+            this.navConfig.target_lon = loc.lon;
+            this.navConfig.target_alt = loc.alt;
+            this.addLog(`Loaded location: ${loc.name}`, 'info');
+        },
+        
+        deleteSelectedLocation() {
+            const idx = this.selectedLocationIdx;
+            if (idx < 0 || idx >= this.savedLocations.length) return;
+            const name = this.savedLocations[idx].name;
+            this.savedLocations.splice(idx, 1);
+            this.persistLocations();
+            this.selectedLocationIdx = -1;
+            this.addLog(`Deleted location: ${name}`, 'info');
+        },
+        
+        saveCurrentPositionAsLocation() {
+            // Save drone's current GPS as a location
+            if (!this.drone.latitude || !this.drone.longitude) {
+                this.addLog('No GPS data available', 'warning');
+                return;
+            }
+            const name = prompt('Enter a name for current drone position:');
+            if (!name || !name.trim()) return;
+            this.savedLocations.push({
+                name: name.trim(),
+                lat: this.drone.latitude,
+                lon: this.drone.longitude,
+                alt: this.navConfig.target_alt
+            });
+            this.persistLocations();
+            this.addLog(`Saved current position as: ${name.trim()}`, 'success');
+        },
+        
         // ========== Navigation ==========
         
         async startNavigation() {
-            if (!this.navConfig.target_lat || !this.navConfig.target_lon) {
+            const lat = parseFloat(this.navConfig.target_lat);
+            const lon = parseFloat(this.navConfig.target_lon);
+            if (isNaN(lat) || isNaN(lon)) {
                 this.addLog('Please enter valid GPS coordinates', 'error');
                 return;
             }

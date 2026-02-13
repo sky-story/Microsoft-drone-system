@@ -299,7 +299,14 @@ class DroneControlSystem:
         # 2. 清空命令队列（防止残留的 tracking 命令覆盖 hover）
         self._drain_cmd_queue()
         
-        # 3. 直接发送 hover 命令（不排队，多次发送）
+        # 3. 先取消 moveTo（如果正在导航中，moveTo 会覆盖 hover 命令）
+        if self.drone and self.drone_status.connected:
+            try:
+                self.drone(CancelMoveTo()).wait(_timeout=2)
+            except Exception:
+                pass
+        
+        # 4. 取消 moveTo 之后再发 hover 命令
         self._send_hover()
         
         self.log("🛑 All systems stopped, drone hovering", "warning")
@@ -689,6 +696,30 @@ class DroneControlSystem:
             
             time.sleep(2)
     
+    def stop_navigation(self):
+        """停止导航 — 正确顺序: CancelMoveTo → hover"""
+        self.log("🛑 Stopping navigation...", "warning")
+        
+        # 1. 设置 stop flag（让 _navigation_task 循环退出）
+        self.nav_stop_flag.set()
+        
+        # 2. 清空命令队列
+        self._drain_cmd_queue()
+        
+        # 3. 先发 CancelMoveTo（必须在 hover 之前！否则 moveTo 会覆盖 hover）
+        if self.drone and self.drone_status.connected:
+            try:
+                self.drone(CancelMoveTo()).wait(_timeout=3)
+            except Exception:
+                pass
+        
+        # 4. CancelMoveTo 之后再发 hover，确保无人机真正停下来
+        self._send_hover()
+        
+        self.navigation_status.state = SystemState.IDLE.value
+        self.navigation_status.message = "Stopped"
+        self.log("🛑 Navigation stopped, drone hovering", "info")
+    
     def start_navigation(self, target_lat: float, target_lon: float, target_alt: float,
                          arrival_threshold: float = 0.5):
         """启动导航任务"""
@@ -750,58 +781,65 @@ class DroneControlSystem:
                 self.navigation_status.state = SystemState.ERROR.value
                 return
             
-            self.log(f"✈️ Flying to target (arrival threshold: {arrival_threshold}m)...", "info")
+            self.log(f"✈️ Flying to target for 5s (threshold: {arrival_threshold}m)...", "info")
             self.navigation_status.message = "Flying..."
             
-            # 监控循环（在自己的线程中，不阻塞 Drone 线程）
-            arrival_count = 0
-            arrival_confirm = 3
+            # 飞行最多 5 秒，每 0.5 秒检查一次是否到达或被停止
+            flight_duration = 5.0  # 秒
+            check_interval = 0.5
+            checks = int(flight_duration / check_interval)  # 10 次
+            arrived_early = False
             
-            for loop in range(200):  # 最多 100 秒
+            for loop in range(checks):
                 if self.nav_stop_flag.is_set() or self.stop_flag.is_set():
-                    # 发送 CancelMoveTo（短暂使用 Drone 线程）
-                    try:
-                        self._run_on_drone_thread(self._do_cancel_moveto, timeout=5)
-                    except:
-                        pass
                     self.navigation_status.state = SystemState.IDLE.value
                     self.navigation_status.message = "Stopped"
-                    self.log("⚠️ Navigation stopped", "warning")
+                    self.log("⚠️ Navigation task exited", "warning")
                     return
                 
-                # 从已缓存的状态读取位置（status thread 持续更新）
+                # 从已缓存的状态读取位置
                 cur_lat = self.drone_status.latitude
                 cur_lon = self.drone_status.longitude
+                
+                elapsed = (loop + 1) * check_interval
+                progress = min(100, int(elapsed / flight_duration * 100))
                 
                 if abs(cur_lat) > 0.001:
                     dist = haversine_m(cur_lat, cur_lon, target_lat, target_lon)
                     self.navigation_status.current_distance = dist
-                    
-                    progress = min(100, int((1 - dist / initial_dist) * 100))
-                    self.navigation_status.progress = max(0, progress)
-                    self.navigation_status.message = f"Flying... {dist:.1f}m remaining"
+                    self.navigation_status.message = f"Flying... {dist:.1f}m remaining ({elapsed:.0f}s/5s)"
                     
                     if dist < arrival_threshold:
-                        arrival_count += 1
-                        if arrival_count >= arrival_confirm:
-                            self.navigation_status.state = SystemState.COMPLETED.value
-                            self.navigation_status.progress = 100
-                            self.navigation_status.message = "Arrived!"
-                            self.log(f"✅ Navigation complete! Distance: {dist:.2f}m", "success")
-                            return
-                    else:
-                        arrival_count = 0
+                        arrived_early = True
+                        self.log(f"✅ Arrived early at {elapsed:.1f}s! Distance: {dist:.2f}m", "success")
+                        break
+                else:
+                    self.navigation_status.message = f"Flying... ({elapsed:.0f}s/5s)"
                 
-                time.sleep(0.5)
+                self.navigation_status.progress = progress
+                time.sleep(check_interval)
             
-            # 超时
+            # 5 秒到或提前到达 → CancelMoveTo + hover → completed
             try:
-                self._run_on_drone_thread(self._do_cancel_moveto, timeout=5)
-            except:
+                self._run_on_drone_thread(self._do_cancel_moveto, timeout=3)
+            except Exception:
                 pass
-            self.navigation_status.state = SystemState.ERROR.value
-            self.navigation_status.message = "Timeout"
-            self.log("⚠️ Navigation timeout", "warning")
+            self._send_hover()
+            
+            self.navigation_status.state = SystemState.COMPLETED.value
+            self.navigation_status.progress = 100
+            if arrived_early:
+                self.navigation_status.message = "Arrived! Hovering. Start Perception when ready."
+            else:
+                self.navigation_status.message = "5s flight done. Hovering. Start Perception when ready."
+                cur_lat = self.drone_status.latitude
+                cur_lon = self.drone_status.longitude
+                if abs(cur_lat) > 0.001:
+                    dist = haversine_m(cur_lat, cur_lon, target_lat, target_lon)
+                    self.navigation_status.current_distance = dist
+                    self.log(f"✅ Navigation complete (5s). Distance to target: {dist:.2f}m. Hovering.", "success")
+                else:
+                    self.log("✅ Navigation complete (5s). Hovering.", "success")
             
         except Exception as e:
             self.navigation_status.state = SystemState.ERROR.value
@@ -993,7 +1031,7 @@ class DroneControlSystem:
             
             # ---- 跟踪参数（基于 fly_track_and_grab.py SafeTracker，针对抖动优化） ----
             # 摄像头朝下，用 roll/pitch 控制水平移动跟踪目标
-            STABILITY_THRESHOLD = 0.15  # 偏移量 < 此值算 "centered"（放宽，容忍抖动）
+            STABILITY_THRESHOLD = 0.25  # 偏移量 < 此值算 "centered"（放宽，容忍抖动）
             DEADZONE = 0.15             # 死区（略小于阈值，让无人机在阈值内仍微调）
             KP = 5.0                    # 比例增益
             MAX_SPEED = 5               # 极保守最大控制量
@@ -1001,7 +1039,7 @@ class DroneControlSystem:
             MAX_LOST_FRAMES = 20        # 目标丢失多少帧后平滑停止
             
             stable_count = 0
-            stable_required = 10         # 累计 5 帧 centered 即触发
+            stable_required = 5          # 累计 5 帧 centered 即触发
             target_lost_frames = 0
             
             # 平滑控制量（roll / pitch，对应 SafeTracker）
@@ -1404,10 +1442,7 @@ def api_perception_stop():
 @app.route('/api/navigation/stop', methods=['POST'])
 def api_navigation_stop():
     """停止导航"""
-    control_system.nav_stop_flag.set()
-    control_system._drain_cmd_queue()
-    control_system._send_hover()
-    control_system.log("🛑 Navigation stopped, drone hovering", "info")
+    control_system.stop_navigation()
     return jsonify({"success": True})
 
 
