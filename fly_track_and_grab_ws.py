@@ -24,6 +24,10 @@ ANAFI Ai: 目标跟踪 + 外部系统控制脚本 (WebSocket版本)
   python fly_track_and_grab_ws.py --classes person
   python fly_track_and_grab_ws.py --classes keyboard --stable-time 5 --wait-time 5 --pull-time 3
   python fly_track_and_grab_ws.py --classes person --lower-length 150 --pull-length 80
+
+测试流程 (mock 飛航+追蹤成功，僅測試 winch 流程):
+  python fly_track_and_grab_ws.py --test-winch-only --classes person
+  python fly_track_and_grab_ws.py --test-winch-only --classes person --no-gripper --lower-length 100 --pull-length 50
 """
 
 import os
@@ -361,6 +365,8 @@ def parse_args():
     p.add_argument("--takeoff-on-start", action="store_true")
     p.add_argument("--auto-land-on-exit", action="store_true", default=False,
                    help="Auto land when program exits (default: False, manual landing)")
+    p.add_argument("--test-winch-only", action="store_true",
+                   help="Mock fly+track success: skip drone/detector/streaming, run only winch grab sequence (for testing)")
     
     return p.parse_args()
 
@@ -1086,6 +1092,22 @@ def main():
     app = FlyTrackAndGrab(args)
     
     try:
+        if args.test_winch_only:
+            # Mock fly+track 成功，只跑 winch 抓取流程（不連無人機、不開偵測與串流）
+            print()
+            print("=" * 60)
+            print("  [TEST] Winch-only mode (mock fly+track success)")
+            print("=" * 60)
+            print(f"  Winch: {args.system_url}")
+            print(f"  Gripper in sequence: {'no' if args.no_gripper else 'yes'} ({args.gripper_url})")
+            print(f"  Lower: {args.lower_length}mm, Pull: {args.pull_length}mm")
+            print("=" * 60)
+            gripper = app.gripper if app.use_gripper_in_sequence else None
+            ok = app.external_system.execute_grab_sequence(gripper=gripper)
+            print()
+            print("[TEST] Winch sequence finished:", "OK" if ok else "FAILED")
+            return 0 if ok else 1
+        
         if not app.connect():
             return 1
         
@@ -1107,49 +1129,52 @@ def main():
     finally:
         print("\n[INFO] Cleaning up...")
         
-        try:
-            cv2.destroyAllWindows()
-            cv2.waitKey(1)
-        except Exception:
-            pass
-        
-        if app.tracker:
-            app.tracker.emergency_stop()
-        try:
-            app.send_piloting(0, 0, 0, 0)
-        except Exception:
-            pass
-        
-        try:
-            app.stop_piloting()
-        except Exception:
-            pass
-        
-        if args.auto_land_on_exit:
+        if args.test_winch_only:
             try:
-                app.land()
+                app.external_system.stop()
             except Exception:
                 pass
-        
-        try:
-            app.stop_streaming()
-        except Exception:
-            pass
-        
-        try:
-            app.disconnect()
-        except Exception:
-            pass
-        
-        # 停止外部系统并断开所有 WebSocket
-        try:
-            app.external_system.stop()
-        except Exception:
-            pass
-        try:
-            app.external_systems.disconnect_all()
-        except Exception:
-            pass
+            try:
+                app.external_systems.disconnect_all()
+            except Exception:
+                pass
+        else:
+            try:
+                cv2.destroyAllWindows()
+                cv2.waitKey(1)
+            except Exception:
+                pass
+            if app.tracker:
+                app.tracker.emergency_stop()
+            try:
+                app.send_piloting(0, 0, 0, 0)
+            except Exception:
+                pass
+            try:
+                app.stop_piloting()
+            except Exception:
+                pass
+            if args.auto_land_on_exit:
+                try:
+                    app.land()
+                except Exception:
+                    pass
+            try:
+                app.stop_streaming()
+            except Exception:
+                pass
+            try:
+                app.disconnect()
+            except Exception:
+                pass
+            try:
+                app.external_system.stop()
+            except Exception:
+                pass
+            try:
+                app.external_systems.disconnect_all()
+            except Exception:
+                pass
         
         print("[OK] Cleanup complete")
     
