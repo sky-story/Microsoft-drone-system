@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-橙色物体颜色追踪 - 最小单元测试脚本（含无人机控制）
-=====================================================
-用途：连接 Parrot Anafi 无人机，用真实摄像头画面验证 HSV 颜色检测，
-      并可选地实际控制无人机追踪橙色目标。
+橙色物体颜色追踪 - 完整测试脚本（含无人机起飞/降落/手动控制/紧急停止）
+========================================================================
+参考 fly_track_and_grab.py 的 SafeTracker + 安全模式 + WASD 手动控制，
+在此基础上增加了 HSV 颜色检测、EMA 平滑、形态学滤波等增强。
 
-两种模式：
-  calibrate  — 只连接无人机看画面 + 调 HSV 参数，不发送任何飞控命令
-  track      — 在 calibrate 基础上，实际发送 roll/pitch 控制无人机追踪目标
-               （需要先手动起飞，脚本不会自动起飞）
+三种模式：
+  calibrate  — 连接无人机看画面 + 调 HSV 参数（不发飞控命令）
+  track      — 完整追踪：起飞/降落/手动控制/自动追踪（参考 fly_track_and_grab.py）
+  webcam     — 离线用笔记本摄像头调参（--webcam）
 
 用法：
-  # 模式1: 连接无人机，只校准参数（安全，不动无人机）
   python test_color_tracking.py --mode calibrate
-
-  # 模式2: 连接无人机，实际追踪（需要先起飞！按 T 启用追踪）
   python test_color_tracking.py --mode track
-
-  # 离线测试: 用笔记本摄像头调参（不需要无人机）
   python test_color_tracking.py --webcam
-  python test_color_tracking.py --webcam --source 1
 
-  # 其他选项
-  python test_color_tracking.py --mode calibrate --no-trackbar
-  python test_color_tracking.py --mode calibrate --ip 10.202.0.1
+按键（track 模式完整列表）：
+  ================================================================
+  最高优先级：
+    SPACE = 紧急停止（立即停止追踪 + 悬停，进入安全模式）
+    L     = 降落（随时可用，不受任何模式限制）
+    Q/ESC = 退出（自动悬停+断开连接）
+  ----------------------------------------------------------------
+  飞行控制：
+    1     = 起飞（约1m悬停，起飞后用 R/F 调高度）
+    T     = 开启/关闭自动追踪（需先起飞并到合适高度）
+  ----------------------------------------------------------------
+  手动飞行（优先级高于自动追踪，松开后 0.25s 自动归零）：
+    W/S   = 前进/后退 (pitch)
+    A/D   = 左移/右移 (roll)
+    Z/E   = 左转/右转 (yaw)
+    R/F   = 上升/下降 (gaz)  ← 起飞后用这个调节高度
+  ----------------------------------------------------------------
+  HSV 校准：
+    P     = 保存 HSV 参数
+    O     = 重置 HSV 为默认橙色
+  ================================================================
 """
+import os
+os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
 
 import argparse
 import json
@@ -39,38 +53,51 @@ import cv2
 import numpy as np
 
 # ========== 默认橙色 HSV 范围 ==========
+# 目标：亮橙色（高饱和度、高亮度）
+# 排除：木头/棕色（低饱和度、低亮度的暗淡橙色）
+# S_min=150 过滤掉暗淡/灰蒙的颜色，V_min=120 过滤掉阴影/暗处
 DEFAULT_HSV = {
     "h_min": 5,   "h_max": 25,
-    "s_min": 100, "s_max": 255,
-    "v_min": 100, "v_max": 255,
+    "s_min": 178, "s_max": 255,
+    "v_min": 120, "v_max": 255,
 }
 
-# ========== 追踪参数（与 drone_control_gui.py 一致） ==========
+# ========== 追踪参数 ==========
+# 基于 fly_track_and_grab.py SafeTracker 默认值，针对颜色追踪场景做防过冲调优。
+# fly_track_and_grab.py 建议防过冲：--kp 3 --max-speed 3 --deadzone 0.25
 STABILITY_THRESHOLD = 0.25   # 偏移量 < 此值算 "centered"
-DEADZONE = 0.15              # 死区
-KP = 5.0                     # 比例增益
-MAX_SPEED = 5                # 最大控制量
-SMOOTHING_CTRL = 0.05        # 控制量平滑系数
-EMA_ALPHA = 0.4              # 中心点 EMA 平滑系数（0~1，越大越灵敏）
+DEADZONE = 0.20              # 死区（放大→靠近中心时更早停止，减少来回震荡）
+KP = 3.0                     # 比例增益（降低→减少过冲）
+MAX_SPEED = 3                # 最大控制量（降低→限制最大飞行速度）
+SMOOTHING_CTRL = 0.10        # 控制量平滑系数（提高→更快响应方向变化，减少惯性过冲）
+MAX_LOST_FRAMES = 20         # 目标丢失多少帧后渐进减速
+MANUAL_SPEED = 25            # 手动控制速度
+MANUAL_TIMEOUT = 0.25        # 手动控制松开后归零的超时
+
+# 颜色检测增强参数（SafeTracker 无此功能，为本脚本新增）
+EMA_ALPHA = 0.4              # 中心点 EMA 平滑系数
 MIN_AREA_RATIO = 0.001       # 最小轮廓面积占帧面积比例
 MORPH_KERNEL_SIZE = 7        # 形态学核大小
 GAUSSIAN_BLUR_SIZE = 5       # 高斯模糊核大小
 
 
 # =====================================================================
-#  Parrot Anafi 无人机连接（参考 drone_control_gui.py）
+#  Parrot Anafi 无人机连接（参考 drone_control_gui.py + fly_track_and_grab.py）
 # =====================================================================
 
 class DroneVideoSource:
-    """通过 Olympe 连接 Parrot Anafi 获取视频帧，并可发送 piloting 命令"""
+    """通过 Olympe 连接 Parrot Anafi，提供视频帧 + 完整飞行控制"""
 
     def __init__(self, ip: str = "192.168.42.1"):
         self.ip = ip
         self.drone = None
         self.connected = False
         self.piloting_started = False
+        self._olympe = None
+        self._FlyingStateChanged = None
+        self._TakeOff = None
+        self._Landing = None
 
-        # 视频帧队列（与 drone_control_gui.py 完全一致）
         self.frame_queue = queue.Queue(maxsize=5)
         self.flush_lock = threading.Lock()
         self.current_frame = None
@@ -78,34 +105,33 @@ class DroneVideoSource:
         self.streaming = False
 
     def connect(self) -> bool:
-        """连接无人机并启动视频流"""
         try:
             import olympe
             import olympe.log
-            # 降低 olympe 日志噪音
+            from olympe.messages.ardrone3.Piloting import TakeOff, Landing
+            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
             olympe.log.update_config({
                 "loggers": {
                     "olympe": {"level": "WARNING"},
                     "ulog": {"level": "ERROR"},
                 }
             })
+            self._olympe = olympe
+            self._FlyingStateChanged = FlyingStateChanged
+            self._TakeOff = TakeOff
+            self._Landing = Landing
         except ImportError:
-            print("[ERROR] olympe 未安装，无法连接无人机")
-            print("        请使用 --webcam 模式进行离线测试")
+            print("[ERROR] olympe 未安装，请使用 --webcam 模式")
             return False
 
-        self._olympe = olympe  # 保存引用
-
         print(f"[INFO] Connecting to drone at {self.ip} ...")
-        self.drone = olympe.Drone(self.ip)
+        self.drone = self._olympe.Drone(self.ip)
 
         for attempt in range(3):
             try:
                 if self.drone.connect():
                     self.connected = True
-                    print(f"[INFO] Connected to drone: {self.ip}")
-
-                    # 启动视频流
+                    print(f"[OK] Connected to drone: {self.ip}")
                     time.sleep(1)
                     self._start_streaming()
                     return True
@@ -117,7 +143,6 @@ class DroneVideoSource:
         return False
 
     def disconnect(self):
-        """断开连接"""
         self.streaming = False
         if self.drone and self.connected:
             try:
@@ -142,7 +167,6 @@ class DroneVideoSource:
             print("[INFO] Disconnected from drone")
 
     def start_piloting(self):
-        """启动 piloting 接口（发送控制命令前需要先调用）"""
         if not self.piloting_started and self.drone and self.connected:
             try:
                 self.drone.start_piloting()
@@ -151,24 +175,91 @@ class DroneVideoSource:
             except Exception as e:
                 print(f"[WARN] Start piloting failed: {e}")
 
+    def takeoff(self) -> bool:
+        """
+        起飞（参考 fly_track_and_grab.py）
+        Parrot Anafi TakeOff() 默认悬停在约 1m 高度。
+        起飞后用 R/F 键手动调整高度（不做自动爬升，避免阻塞按键响应）。
+        """
+        if not self.drone or not self.connected:
+            print("[ERROR] Drone not connected")
+            return False
+        self.start_piloting()
+        print("[INFO] Taking off ...")
+        try:
+            result = self.drone(
+                self._TakeOff()
+                >> self._FlyingStateChanged(state="hovering", _timeout=20)
+            ).wait()
+            if result.success():
+                print("[OK] Hovering at ~1m")
+                print("[TIP] Use R key to go UP, F key to go DOWN")
+                return True
+            else:
+                time.sleep(2)
+                st = self._get_flying_state()
+                if st in ("hovering", "flying", "takingoff"):
+                    print(f"[OK] Takeoff confirmed via state check: {st}")
+                    print("[TIP] Use R key to go UP, F key to go DOWN")
+                    return True
+                print("[ERROR] Takeoff failed")
+                return False
+        except Exception as e:
+            print(f"[ERROR] Takeoff exception: {e}")
+            return False
+
+    def land(self) -> bool:
+        """降落（参考 fly_track_and_grab.py）"""
+        if not self.drone or not self.connected:
+            print("[ERROR] Drone not connected")
+            return False
+        print("[INFO] Landing ...")
+        try:
+            result = self.drone(
+                self._Landing()
+                >> self._FlyingStateChanged(state="landed", _timeout=30)
+            ).wait()
+            if result.success():
+                print("[OK] Landed")
+                return True
+            else:
+                time.sleep(2)
+                st = self._get_flying_state()
+                if st in ("landed", "landing"):
+                    print(f"[OK] Landing confirmed via state check: {st}")
+                    return True
+                print("[ERROR] Landing failed")
+                return False
+        except Exception as e:
+            print(f"[ERROR] Landing exception: {e}")
+            return False
+
+    def _get_flying_state(self) -> str:
+        try:
+            st = self.drone.get_state(self._FlyingStateChanged)
+            if st:
+                state = st.get("state")
+                return getattr(state, "name", str(state)) if state else "unknown"
+        except Exception:
+            pass
+        return "unknown"
+
     def send_piloting(self, roll: int, pitch: int, yaw: int = 0, gaz: int = 0):
-        """发送 piloting 命令（roll/pitch/yaw/gaz）"""
         if self.drone and self.connected and self.piloting_started:
             self.drone.piloting(roll, pitch, yaw, gaz, 0.05)
 
     def hover(self):
-        """发送悬停命令（归零）"""
+        """多次发送悬停确保生效（参考 drone_control_gui.py._send_hover）"""
         if self.drone and self.connected and self.piloting_started:
             for _ in range(5):
                 self.drone.piloting(0, 0, 0, 0, 0.05)
                 time.sleep(0.05)
 
     def get_frame(self):
-        """获取当前帧（线程安全）"""
         with self.frame_lock:
             return self.current_frame.copy() if self.current_frame is not None else None
 
-    # ---- 内部方法（与 drone_control_gui.py 一致） ----
+    # ---- 内部视频流方法 ----
 
     def _yuv_frame_cb(self, yuv_frame):
         try:
@@ -207,10 +298,8 @@ class DroneVideoSource:
                 last = f
             except queue.Empty:
                 break
-
         if last is None:
             return None
-
         try:
             fmt = last.format()
             cv2_flag = {
@@ -252,7 +341,7 @@ class DroneVideoSource:
 
 
 class WebcamVideoSource:
-    """笔记本摄像头视频源（离线调试用，接口与 DroneVideoSource 一致）"""
+    """笔记本摄像头视频源（离线调试用）"""
 
     def __init__(self, source=0):
         self.source = source
@@ -271,7 +360,6 @@ class WebcamVideoSource:
             print(f"[INFO] Webcam opened: {w}x{h}")
             self.connected = True
             return True
-        print("[ERROR] Cannot read from webcam")
         return False
 
     def disconnect(self):
@@ -281,10 +369,17 @@ class WebcamVideoSource:
 
     def start_piloting(self):
         self.piloting_started = True
-        print("[INFO] Piloting (simulated) - webcam mode, no drone commands")
+
+    def takeoff(self) -> bool:
+        print("[SIM] Takeoff (simulated)")
+        return True
+
+    def land(self) -> bool:
+        print("[SIM] Land (simulated)")
+        return True
 
     def send_piloting(self, roll: int, pitch: int, yaw: int = 0, gaz: int = 0):
-        pass  # 没有真正的无人机，不发送命令
+        pass
 
     def hover(self):
         pass
@@ -297,20 +392,36 @@ class WebcamVideoSource:
 
 
 # =====================================================================
-#  颜色追踪器（与之前版本一致，核心检测+控制逻辑）
+#  颜色追踪器（含 SafeTracker 完整控制逻辑 + 颜色检测增强）
 # =====================================================================
 
 class ColorTracker:
-    """橙色物体颜色追踪器（完整处理流水线）"""
+    """
+    橙色物体颜色追踪器
+
+    检测流水线（新增）：GaussianBlur → HSV → inRange → morphologyEx → contour → EMA
+    控制流水线（对齐 SafeTracker）：deadzone → P 控制 → 矢量限速 → 平滑 → 丢失渐进减速
+    """
 
     def __init__(self, hsv_params: dict = None):
         self.hsv = hsv_params or DEFAULT_HSV.copy()
+
+        # EMA 平滑中心点
         self._smooth_cx = None
         self._smooth_cy = None
+
+        # 控制量（对齐 SafeTracker 字段名）
         self._smooth_roll = 0.0
         self._smooth_pitch = 0.0
+
+        # 稳定性（对齐 SafeTracker.stable_frames）
         self.stable_count = 0
         self.stable_required = 5
+
+        # 丢失帧计数（对齐 SafeTracker.target_lost_frames / max_lost_frames）
+        self.target_lost_frames = 0
+
+        # FPS
         self._last_time = time.time()
         self._fps = 0.0
 
@@ -360,6 +471,7 @@ class ColorTracker:
         raw_cx = int(M["m10"] / M["m00"])
         raw_cy = int(M["m01"] / M["m00"])
 
+        # EMA 平滑（SafeTracker 无此功能，本脚本改进）
         if self._smooth_cx is None:
             self._smooth_cx = float(raw_cx)
             self._smooth_cy = float(raw_cy)
@@ -374,22 +486,37 @@ class ColorTracker:
 
     def compute_control(self, center, frame_shape):
         """
-        计算追踪控制量
+        计算追踪控制量（完全对齐 SafeTracker.update + _smooth_stop 逻辑）
         返回 (roll_cmd, pitch_cmd, offset_x, offset_y, offset_mag, is_stable)
         """
         h, w = frame_shape[:2]
 
         if center is None:
-            self._smooth_roll *= (1 - SMOOTHING_CTRL)
-            self._smooth_pitch *= (1 - SMOOTHING_CTRL)
+            # ---- 目标丢失分支（对齐 SafeTracker） ----
+            self.target_lost_frames += 1
             self.stable_count = 0
-            return 0, 0, 0.0, 0.0, 0.0, False
+
+            # 渐进减速：丢失 MAX_LOST_FRAMES 帧后才开始平滑停止
+            # 避免短暂遮挡导致突然停止
+            if self.target_lost_frames >= MAX_LOST_FRAMES:
+                self._smooth_roll *= (1 - SMOOTHING_CTRL)
+                self._smooth_pitch *= (1 - SMOOTHING_CTRL)
+                if abs(self._smooth_roll) < 0.5:
+                    self._smooth_roll = 0
+                if abs(self._smooth_pitch) < 0.5:
+                    self._smooth_pitch = 0
+
+            return int(self._smooth_roll), int(self._smooth_pitch), 0.0, 0.0, 0.0, False
+
+        # ---- 目标检测到 ----
+        self.target_lost_frames = 0
 
         cx, cy = center
         offset_x = (cx - w / 2) / (w / 2)
         offset_y = (cy - h / 2) / (h / 2)
         offset_mag = math.sqrt(offset_x ** 2 + offset_y ** 2)
 
+        # 稳定性（drone_control_gui.py 渐进衰减，比 SafeTracker 硬重置更抗抖动）
         if offset_mag < STABILITY_THRESHOLD:
             self.stable_count += 1
         else:
@@ -397,22 +524,33 @@ class ColorTracker:
 
         is_stable = self.stable_count >= self.stable_required
 
+        # 死区
         ctrl_x = 0.0 if abs(offset_x) < DEADZONE else offset_x
         ctrl_y = 0.0 if abs(offset_y) < DEADZONE else offset_y
 
+        # P 控制（摄像头朝下：offset_x→roll, offset_y→-pitch）
         target_roll = max(-MAX_SPEED, min(MAX_SPEED, ctrl_x * KP))
         target_pitch = max(-MAX_SPEED, min(MAX_SPEED, -ctrl_y * KP))
 
+        # 矢量限速
         mag = math.sqrt(target_roll ** 2 + target_pitch ** 2)
         if mag > MAX_SPEED:
             scale = MAX_SPEED / mag
             target_roll *= scale
             target_pitch *= scale
 
+        # 平滑
         self._smooth_roll = self._smooth_roll * (1 - SMOOTHING_CTRL) + target_roll * SMOOTHING_CTRL
         self._smooth_pitch = self._smooth_pitch * (1 - SMOOTHING_CTRL) + target_pitch * SMOOTHING_CTRL
 
         return int(self._smooth_roll), int(self._smooth_pitch), offset_x, offset_y, offset_mag, is_stable
+
+    def emergency_stop(self):
+        """紧急停止（对齐 SafeTracker.emergency_stop）"""
+        self._smooth_roll = 0
+        self._smooth_pitch = 0
+        self.stable_count = 0
+        self.target_lost_frames = 0
 
     def update_fps(self):
         now = time.time()
@@ -424,31 +562,103 @@ class ColorTracker:
 
 
 # =====================================================================
+#  手动控制管理器（参考 fly_track_and_grab.py 的手动控制逻辑）
+# =====================================================================
+
+class ManualController:
+    """
+    手动飞行控制（优先级高于自动追踪）
+    参考 fly_track_and_grab.py：手动按键覆盖自动跟踪，松开后自动衰减归零
+    """
+
+    def __init__(self, speed: int = MANUAL_SPEED, timeout: float = MANUAL_TIMEOUT):
+        self.speed = speed
+        self.timeout = timeout
+        self.roll = 0
+        self.pitch = 0
+        self.yaw = 0
+        self.gaz = 0
+        self.last_time = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "gaz": 0.0}
+
+    def set_axis(self, axis: str, value: int):
+        clamp = lambda v: max(-100, min(100, v))
+        if axis == "roll":
+            self.roll = clamp(value)
+        elif axis == "pitch":
+            self.pitch = clamp(value)
+        elif axis == "yaw":
+            self.yaw = clamp(value)
+        elif axis == "gaz":
+            self.gaz = clamp(value)
+        self.last_time[axis] = time.time()
+
+    def decay(self):
+        """自动衰减（松开按键后 timeout 秒归零）"""
+        now = time.time()
+        if now - self.last_time["roll"] > self.timeout:
+            self.roll = 0
+        if now - self.last_time["pitch"] > self.timeout:
+            self.pitch = 0
+        if now - self.last_time["yaw"] > self.timeout:
+            self.yaw = 0
+        if now - self.last_time["gaz"] > self.timeout:
+            self.gaz = 0
+
+    def has_active_input(self) -> bool:
+        now = time.time()
+        return any(now - self.last_time[a] <= self.timeout for a in self.last_time)
+
+    def reset(self):
+        self.roll = self.pitch = self.yaw = self.gaz = 0
+
+
+# =====================================================================
 #  可视化绘制
 # =====================================================================
 
 def draw_overlay(frame, bbox, center, confidence, offset_x, offset_y, offset_mag,
                  roll_cmd, pitch_cmd, stable_count, stable_required, is_stable, fps,
-                 mode_label="CALIBRATE", tracking_active=False):
-    """在帧上绘制追踪可视化叠加层"""
+                 mode_label="CALIBRATE", tracking_active=False, safe_mode=False,
+                 manual_ctrl=None, final_roll=0, final_pitch=0, final_yaw=0, final_gaz=0):
     display = frame.copy()
     h, w = display.shape[:2]
     cx_frame, cy_frame = w // 2, h // 2
 
-    # 稳定区域圆圈
+    # ---- 安全模式全屏橙色遮罩（最高优先级，参考 fly_track_and_grab.py） ----
+    if safe_mode:
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 140, 255), -1)
+        display = cv2.addWeighted(overlay, 0.12, display, 0.88, 0)
+
+        warning = "[SAFE MODE] TRACKING OFF - HOVER"
+        ts = cv2.getTextSize(warning, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)[0]
+        tx = (w - ts[0]) // 2
+        cv2.rectangle(display, (tx - 15, 10), (tx + ts[0] + 15, 50), (0, 100, 200), -1)
+        cv2.rectangle(display, (tx - 15, 10), (tx + ts[0] + 15, 50), (0, 165, 255), 3)
+        cv2.putText(display, warning, (tx, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3)
+
+        hint = "WASD=move  L=LAND  SPACE=resume  Q=quit"
+        hs = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+        hx = (w - hs[0]) // 2
+        cv2.putText(display, hint, (hx, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        ctrl = f"roll:{final_roll:+3d}  pitch:{final_pitch:+3d}  yaw:{final_yaw:+3d}  gaz:{final_gaz:+3d}"
+        cv2.putText(display, ctrl, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+        return display
+
+    # ---- 稳定区域圆圈 ----
     stable_radius = int(STABILITY_THRESHOLD * (w / 2))
     circle_color = (0, 255, 0) if (bbox is not None and offset_mag < STABILITY_THRESHOLD) else (80, 80, 80)
     cv2.circle(display, (cx_frame, cy_frame), stable_radius, circle_color, 2)
 
-    # 画面中心十字
+    # ---- 中心十字 ----
     cv2.line(display, (cx_frame - 30, cy_frame), (cx_frame + 30, cy_frame), (255, 255, 255), 1)
     cv2.line(display, (cx_frame, cy_frame - 30), (cx_frame, cy_frame + 30), (255, 255, 255), 1)
 
-    # 检测结果
+    # ---- 检测框 ----
     if bbox is not None and center is not None:
         x1, y1, x2, y2 = bbox
         tcx, tcy = center
-
         if is_stable:
             box_color = (0, 255, 0)
         elif offset_mag < STABILITY_THRESHOLD:
@@ -457,51 +667,50 @@ def draw_overlay(frame, bbox, center, confidence, offset_x, offset_y, offset_mag
             box_color = (0, 255, 255)
         else:
             box_color = (0, 140, 255)
-
         cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
         cv2.circle(display, (tcx, tcy), 6, box_color, -1)
         cv2.line(display, (cx_frame, cy_frame), (tcx, tcy), box_color, 2)
-
-        label = f"orange  conf={confidence:.0%}"
-        cv2.putText(display, label, (x1, y1 - 10),
+        cv2.putText(display, f"orange  conf={confidence:.0%}", (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-    # 顶部状态栏
+    # ---- 顶部状态栏 ----
     overlay = display.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 95), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 100), (0, 0, 0), -1)
     display = cv2.addWeighted(overlay, 0.6, display, 0.4, 0)
 
-    # 模式标签
+    # 模式 + 追踪状态
     if tracking_active:
         mode_color = (0, 0, 255)
-        mode_text = f"[{mode_label}] TRACKING ACTIVE - Sending commands!"
+        mode_text = f"[{mode_label}] AUTO-TRACKING ON"
     else:
         mode_color = (255, 200, 0)
-        mode_text = f"[{mode_label}] View only"
+        mode_text = f"[{mode_label}] Tracking OFF"
 
-    cv2.putText(display, mode_text, (10, 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2)
+    cv2.putText(display, mode_text, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2)
 
+    # 检测状态
     if bbox is not None:
         if is_stable:
             status = "STABLE - Target centered!"
             s_color = (0, 255, 0)
         else:
-            status = f"Tracking  offset={offset_mag:.2f}  stable={stable_count}/{stable_required}"
+            status = f"Detected  offset={offset_mag:.2f}  stable={stable_count}/{stable_required}"
             s_color = (0, 255, 255)
     else:
         status = "Searching..."
         s_color = (100, 100, 255)
 
-    cv2.putText(display, status, (10, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, s_color, 2)
+    cv2.putText(display, status, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, s_color, 2)
 
-    info = f"offset: x={offset_x:+.2f} y={offset_y:+.2f} | roll={roll_cmd:+d} pitch={pitch_cmd:+d} | FPS={fps:.0f}"
-    cv2.putText(display, info, (10, 62),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
+    # 控制量（显示最终实际发送值，含手动覆盖）
+    manual_tag = " [MANUAL]" if (manual_ctrl and manual_ctrl.has_active_input()) else ""
+    ctrl_info = (f"send: roll={final_roll:+d} pitch={final_pitch:+d} "
+                 f"yaw={final_yaw:+d} gaz={final_gaz:+d}{manual_tag} | "
+                 f"auto: r={roll_cmd:+d} p={pitch_cmd:+d} | FPS={fps:.0f}")
+    cv2.putText(display, ctrl_info, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
     # 稳定度进度条
-    bar_x, bar_y, bar_w, bar_h = 10, 72, 200, 12
+    bar_x, bar_y, bar_w, bar_h = 10, 75, 200, 12
     cv2.rectangle(display, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
     fill = int(bar_w * min(stable_count, stable_required) / stable_required) if stable_required > 0 else 0
     bar_c = (0, 255, 0) if is_stable else (0, 200, 255)
@@ -510,10 +719,9 @@ def draw_overlay(frame, bbox, center, confidence, offset_x, offset_y, offset_mag
     cv2.putText(display, f"{stable_count}/{stable_required}", (bar_x + bar_w + 5, bar_y + 11),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
 
-    # 底部操作提示
-    hints = "[S]ave  [R]eset  [T]rack on/off  [H]over  [Q]uit"
-    cv2.putText(display, hints, (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    # 底部提示
+    hints = "SPACE=STOP  L=Land  T=Track  WASD=Move  P=Save  O=Reset  Q=Quit"
+    cv2.putText(display, hints, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
 
     return display
 
@@ -525,7 +733,6 @@ def draw_overlay(frame, bbox, center, confidence, offset_x, offset_y, offset_mag
 def nothing(_):
     pass
 
-
 def create_trackbars(window_name: str, hsv: dict):
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 400, 300)
@@ -535,7 +742,6 @@ def create_trackbars(window_name: str, hsv: dict):
     cv2.createTrackbar("S max", window_name, hsv["s_max"], 255, nothing)
     cv2.createTrackbar("V min", window_name, hsv["v_min"], 255, nothing)
     cv2.createTrackbar("V max", window_name, hsv["v_max"], 255, nothing)
-
 
 def read_trackbars(window_name: str) -> dict:
     return {
@@ -547,13 +753,10 @@ def read_trackbars(window_name: str) -> dict:
         "v_max": cv2.getTrackbarPos("V max", window_name),
     }
 
-
 def save_params(hsv: dict, path: str = "color_tracking_params.json"):
     with open(path, "w") as f:
         json.dump(hsv, f, indent=2)
-    print(f"[INFO] HSV params saved to {path}")
-    print(f"       {hsv}")
-
+    print(f"[INFO] HSV params saved to {path}: {hsv}")
 
 def load_params(path: str = "color_tracking_params.json") -> dict:
     p = Path(path)
@@ -570,47 +773,44 @@ def load_params(path: str = "color_tracking_params.json") -> dict:
 # =====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="橙色物体颜色追踪测试（含无人机控制）")
+    parser = argparse.ArgumentParser(
+        description="橙色物体颜色追踪测试（完整飞控 + HSV 校准）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--mode", choices=["calibrate", "track"], default="calibrate",
-                        help="calibrate: 只看画面调参, track: 实际控制无人机追踪")
-    parser.add_argument("--ip", default="192.168.42.1",
-                        help="无人机 IP 地址 (默认: 192.168.42.1)")
+                        help="calibrate=只看画面, track=完整飞控+追踪")
+    parser.add_argument("--ip", default="192.168.42.1")
     parser.add_argument("--webcam", action="store_true",
-                        help="使用笔记本摄像头（离线调试，不连接无人机）")
+                        help="用笔记本摄像头（不连无人机）")
     parser.add_argument("--source", default="0",
-                        help="webcam 模式下的摄像头编号或视频文件路径")
-    parser.add_argument("--no-trackbar", action="store_true",
-                        help="不显示 HSV 校准滑块")
-    parser.add_argument("--params", default="color_tracking_params.json",
-                        help="HSV 参数文件路径")
+                        help="webcam 模式的摄像头编号/视频文件")
+    parser.add_argument("--no-trackbar", action="store_true")
+    parser.add_argument("--params", default="color_tracking_params.json")
     args = parser.parse_args()
 
-    # ---- 加载 HSV 参数 ----
+    # 加载 HSV 参数
     saved = load_params(args.params)
     hsv_params = saved if saved else DEFAULT_HSV.copy()
 
-    # ---- 创建视频源 ----
+    # 创建视频源
     if args.webcam:
         source = int(args.source) if args.source.isdigit() else args.source
         video_src = WebcamVideoSource(source)
         mode_label = "WEBCAM"
-        can_track = False
-        print("[INFO] Webcam mode - no drone connection")
+        can_fly = False
     else:
         video_src = DroneVideoSource(ip=args.ip)
         mode_label = args.mode.upper()
-        can_track = (args.mode == "track")
+        can_fly = (args.mode == "track")
 
-    # ---- 连接 ----
     if not video_src.connect():
         return
 
-    # 等待无人机视频流稳定
     if not args.webcam:
-        print("[INFO] Waiting for video stream to stabilize (3s) ...")
+        print("[INFO] Waiting for video stream (3s) ...")
         time.sleep(3)
 
-    # ---- 创建窗口 ----
+    # 窗口
     win_main = "Color Tracking Test"
     win_mask = "HSV Mask"
     cv2.namedWindow(win_main, cv2.WINDOW_NORMAL)
@@ -621,87 +821,222 @@ def main():
     if use_trackbar:
         create_trackbars(trackbar_win, hsv_params)
 
-    # ---- 初始化追踪器 ----
+    # 初始化
     tracker = ColorTracker(hsv_params)
-
-    # 追踪控制开关（track 模式下按 T 切换）
+    manual = ManualController()
     tracking_active = False
+    safe_mode = False
 
     print()
-    print("=" * 55)
+    print("=" * 65)
     print("  Orange Color Tracking Test")
     print(f"  Mode: {mode_label}")
-    if can_track:
-        print("  WARNING: Track mode - drone WILL move when tracking is ON!")
-        print("  Make sure the drone is FLYING before enabling tracking!")
-    print("=" * 55)
-    print("  [S] Save HSV params        [R] Reset to default")
-    print("  [T] Toggle tracking on/off [H] Send hover (stop)")
-    print("  [Q] Quit")
-    print("=" * 55)
+    print("=" * 65)
+    if can_fly:
+        print("  SPACE  = EMERGENCY STOP (highest priority)")
+        print("  L      = Land (always available)")
+        print("  1      = Takeoff (~1m), then use R/F to adjust altitude")
+        print("  T      = Toggle auto-tracking on/off")
+        print("  W/S    = Forward/Backward   A/D = Left/Right")
+        print("  Z/E    = Yaw left/right     R/F = Up/Down (adjust altitude!)")
+    print("  P      = Save HSV params    O   = Reset HSV")
+    print("  Q/ESC  = Quit")
+    print("=" * 65)
+    if can_fly:
+        print()
+        print("  Tracking params (ref: SafeTracker):")
+        print(f"    KP={KP}  MAX_SPEED={MAX_SPEED}  DEADZONE={DEADZONE}")
+        print(f"    SMOOTHING={SMOOTHING_CTRL}  STABILITY={STABILITY_THRESHOLD}")
+        print(f"    MANUAL_SPEED={MANUAL_SPEED}  TIMEOUT={MANUAL_TIMEOUT}s")
     print()
 
     try:
         while True:
-            # 获取帧
             frame = video_src.get_frame()
-            if frame is None:
-                time.sleep(0.01)
-                continue
 
-            # 从滑块更新 HSV 参数
-            if use_trackbar:
-                tracker.hsv = read_trackbars(trackbar_win)
-
-            # 检测
-            bbox, center, mask, confidence = tracker.detect(frame)
-
-            # 计算控制量
-            roll, pitch, ox, oy, om, stable = tracker.compute_control(center, frame.shape)
-
-            # ---- 发送实际控制命令 ----
-            if tracking_active and can_track and center is not None:
-                video_src.send_piloting(roll, pitch)
-            elif tracking_active and can_track and center is None:
-                # 目标丢失 → 悬停
-                video_src.send_piloting(0, 0)
-
-            # FPS
+            # 初始化默认值（无论有没有帧，按键和手动控制都要处理）
+            bbox = center = None
+            mask = None
+            confidence = 0.0
+            auto_roll = auto_pitch = 0
+            ox = oy = om = 0.0
+            stable = False
             fps = tracker.update_fps()
 
-            # 绘制可视化
-            display = draw_overlay(
-                frame, bbox, center, confidence,
-                ox, oy, om, roll, pitch,
-                tracker.stable_count, tracker.stable_required,
-                stable, fps,
-                mode_label=mode_label,
-                tracking_active=tracking_active,
-            )
+            if frame is not None:
+                # 滑块更新
+                if use_trackbar:
+                    tracker.hsv = read_trackbars(trackbar_win)
 
-            # Mask 可视化
-            mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(mask_colored, contours, -1, (0, 255, 0), 2)
-            if center is not None:
-                cv2.circle(mask_colored, center, 8, (0, 0, 255), -1)
+                # 检测
+                bbox, center, mask, confidence = tracker.detect(frame)
 
-            cv2.imshow(win_main, display)
-            cv2.imshow(win_mask, mask_colored)
+                # 计算自动追踪控制量
+                auto_roll, auto_pitch, ox, oy, om, stable = tracker.compute_control(
+                    center, frame.shape
+                )
 
-            # ---- 键盘事件 ----
+            # 手动控制衰减（无论有没有帧都要执行）
+            manual.decay()
+
+            # ======== 最终控制量决定（优先级系统） ========
+            final_roll = final_pitch = final_yaw = final_gaz = 0
+
+            if safe_mode:
+                tracker.emergency_stop()
+                final_roll = manual.roll
+                final_pitch = manual.pitch
+                final_yaw = manual.yaw
+                final_gaz = manual.gaz
+            elif tracking_active and can_fly:
+                # 手动输入覆盖自动
+                final_roll = manual.roll if manual.roll != 0 else auto_roll
+                final_pitch = manual.pitch if manual.pitch != 0 else auto_pitch
+                final_yaw = manual.yaw
+                final_gaz = manual.gaz
+            else:
+                final_roll = manual.roll
+                final_pitch = manual.pitch
+                final_yaw = manual.yaw
+                final_gaz = manual.gaz
+
+            # 发送控制命令
+            if can_fly and video_src.piloting_started:
+                video_src.send_piloting(final_roll, final_pitch, final_yaw, final_gaz)
+
+            # 绘制显示
+            if frame is not None:
+                display = draw_overlay(
+                    frame, bbox, center, confidence,
+                    ox, oy, om, auto_roll, auto_pitch,
+                    tracker.stable_count, tracker.stable_required,
+                    stable, fps,
+                    mode_label=mode_label,
+                    tracking_active=tracking_active,
+                    safe_mode=safe_mode,
+                    manual_ctrl=manual,
+                    final_roll=final_roll, final_pitch=final_pitch,
+                    final_yaw=final_yaw, final_gaz=final_gaz,
+                )
+
+                if mask is not None:
+                    mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(mask_colored, contours, -1, (0, 255, 0), 2)
+                    if center is not None:
+                        cv2.circle(mask_colored, center, 8, (0, 0, 255), -1)
+                    cv2.imshow(win_mask, mask_colored)
+
+                cv2.imshow(win_main, display)
+            else:
+                # 没有帧时显示占位图（确保窗口存在以接收按键）
+                placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(placeholder, "Waiting for video...", (150, 170),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+                cv2.putText(placeholder, "Press 1=Takeoff  L=Land  Q=Quit", (120, 210),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1)
+                cv2.imshow(win_main, placeholder)
+                time.sleep(0.02)
+
+            # ======== 键盘事件 ========
             key = cv2.waitKey(1) & 0xFF
 
+            # --- 最高优先级：退出 ---
             if key == ord('q') or key == 27:  # Q / ESC
-                if tracking_active:
+                if can_fly:
+                    tracker.emergency_stop()
                     video_src.hover()
                     print("[INFO] Hover sent before quit")
                 break
 
-            elif key == ord('s'):
+            # --- 最高优先级：紧急停止 / 安全模式 (SPACE) ---
+            elif key == ord(' '):
+                if can_fly:
+                    safe_mode = not safe_mode
+                    if safe_mode:
+                        tracking_active = False
+                        tracker.emergency_stop()
+                        manual.reset()
+                        video_src.hover()
+                        print("[SAFE MODE] ON - Auto-tracking DISABLED, hover, manual control ENABLED")
+                    else:
+                        print("[SAFE MODE] OFF - You can now press T to resume tracking")
+
+            # --- 降落 (L) - 不受任何模式限制 ---
+            elif key == ord('l') or key == ord('L'):
+                if can_fly:
+                    tracking_active = False
+                    safe_mode = False
+                    tracker.emergency_stop()
+                    manual.reset()
+                    video_src.hover()
+                    time.sleep(0.3)
+                    video_src.land()
+
+            # --- 起飞 (数字键 1) ---
+            elif key == ord('1'):
+                if can_fly and not safe_mode:
+                    video_src.takeoff()
+                elif safe_mode:
+                    print("[WARN] Takeoff blocked in SAFE MODE, press SPACE first")
+
+            # --- 追踪开关 (T) ---
+            elif key == ord('t') or key == ord('T'):
+                if can_fly and not safe_mode:
+                    tracking_active = not tracking_active
+                    if tracking_active:
+                        video_src.start_piloting()
+                        print("[INFO] >>> AUTO-TRACKING ON <<<")
+                    else:
+                        tracker.emergency_stop()
+                        video_src.hover()
+                        print("[INFO] >>> AUTO-TRACKING OFF - hover <<<")
+                elif safe_mode:
+                    print("[WARN] Cannot enable tracking in SAFE MODE, press SPACE first")
+                elif not can_fly:
+                    print("[WARN] Tracking not available in this mode (use --mode track)")
+
+            # --- 手动悬停 (H) ---
+            elif key == ord('h') or key == ord('H'):
+                if can_fly:
+                    tracking_active = False
+                    tracker.emergency_stop()
+                    manual.reset()
+                    video_src.hover()
+                    print("[INFO] Manual hover, tracking off")
+
+            # --- 手动飞行 WASD/ZE/RF（大小写均可） ---
+            elif key in (ord('w'), ord('W')):
+                if can_fly:
+                    manual.set_axis("pitch", MANUAL_SPEED)
+            elif key in (ord('s'), ord('S')):
+                if can_fly:
+                    manual.set_axis("pitch", -MANUAL_SPEED)
+            elif key in (ord('a'), ord('A')):
+                if can_fly:
+                    manual.set_axis("roll", -MANUAL_SPEED)
+            elif key in (ord('d'), ord('D')):
+                if can_fly:
+                    manual.set_axis("roll", MANUAL_SPEED)
+            elif key in (ord('z'), ord('Z')):
+                if can_fly:
+                    manual.set_axis("yaw", -MANUAL_SPEED)
+            elif key in (ord('e'), ord('E')):
+                if can_fly:
+                    manual.set_axis("yaw", MANUAL_SPEED)
+            elif key in (ord('r'), ord('R')):
+                if can_fly:
+                    manual.set_axis("gaz", MANUAL_SPEED)
+            elif key in (ord('f'), ord('F')):
+                if can_fly:
+                    manual.set_axis("gaz", -MANUAL_SPEED)
+
+            # --- HSV 参数保存 (P) ---
+            elif key == ord('p') or key == ord('P'):
                 save_params(tracker.hsv.copy(), args.params)
 
-            elif key == ord('r'):
+            # --- HSV 参数重置 (O) ---
+            elif key == ord('o') or key == ord('O'):
                 tracker.hsv = DEFAULT_HSV.copy()
                 if use_trackbar:
                     for k, v in DEFAULT_HSV.items():
@@ -710,34 +1045,19 @@ def main():
                             cv2.setTrackbarPos(bar_name, trackbar_win, v)
                         except Exception:
                             pass
-                print("[INFO] Reset to default orange HSV params")
-
-            elif key == ord('t'):
-                if can_track:
-                    tracking_active = not tracking_active
-                    if tracking_active:
-                        video_src.start_piloting()
-                        print("[INFO] >>> TRACKING ON - drone will move! <<<")
-                    else:
-                        video_src.hover()
-                        print("[INFO] >>> TRACKING OFF - hover <<<")
-                else:
-                    print("[WARN] Tracking not available in this mode")
-                    print("       Use --mode track to enable drone control")
-
-            elif key == ord('h'):
-                if can_track:
-                    video_src.hover()
-                    tracking_active = False
-                    print("[INFO] Hover command sent, tracking off")
+                print("[INFO] HSV reset to default orange")
 
     except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user")
+        print("\n[INFO] Ctrl+C")
     finally:
-        # 确保退出时悬停
-        if can_track and tracking_active:
-            print("[INFO] Sending hover before exit...")
-            video_src.hover()
+        if can_fly:
+            print("[INFO] Cleaning up...")
+            tracker.emergency_stop()
+            manual.reset()
+            try:
+                video_src.hover()
+            except Exception:
+                pass
 
         video_src.disconnect()
         cv2.destroyAllWindows()
