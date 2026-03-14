@@ -2,14 +2,23 @@
 #include <WebSocketsServer.h>
 #include <ESP32Servo.h>
 
-// ====== WiFi ======
-// IP -> ws://192.168.42.39:81
-// const char* ssid = "ANAFI Ai 001699";
-// const char* password = "HK433JUKWP53";
+// ====== WiFi #1: ANAFI ======
+const char* ssid1 = "ANAFI Ai 001699";
+const char* password1 = "HK433JUKWP53";
+IPAddress local_IP1(192, 168, 42, 40);
+IPAddress gateway1(192, 168, 42, 1);
+IPAddress subnet1(255, 255, 255, 0);
 
-// IP -> ws://172.20.10.3:81
-const char* ssid = "Itzsyboo";
-const char* password = "0955399980";
+// ====== WiFi #2: Itzsyboo ======
+const char* ssid2 = "Itzsyboo";
+const char* password2 = "0955399980";
+IPAddress local_IP2(172, 20, 10, 2);
+IPAddress gateway2(172, 20, 10, 1);
+IPAddress subnet2(255, 255, 255, 0);
+
+// ====== DNS (optional) ======
+IPAddress dns1(8, 8, 8, 8);
+IPAddress dns2(8, 8, 4, 4);
 
 // ====== Servo / Winch ======
 Servo servo;
@@ -20,7 +29,7 @@ const int PULL_US  = 1700; // up
 const int LOWER_US = 1300; // down
 
 // ====== Hall sensor ======
-const int hallPin = 27;                 // pick a GPIO that supports interrupts
+const int hallPin = 19;                 // pick a GPIO that supports interrupts
 const int PULSES_PER_REV = 1;           // start with 1 magnet -> 1 pulse per rev
 const float SPOOL_DIAMETER_MM = 15.7f;
 const float CIRC_MM = 3.1415926f * SPOOL_DIAMETER_MM; // ~49.32mm per rev
@@ -30,10 +39,16 @@ volatile unsigned long lastPulseUs = 0; // for debounce
 const unsigned long DEBOUNCE_US = 3000; // 3ms debounce (tune if noisy)
 
 // ====== Limit switch (Top) ======
-const int topLimitPin = 26;             // choose a free GPIO that supports interrupts
+const int topLimitPin = 5;             // choose a free GPIO that supports interrupts
 volatile bool topHit = false;
 volatile unsigned long lastTopUs = 0;
 const unsigned long TOP_DEBOUNCE_US = 5000; // 5ms debounce (tune if noisy)
+
+// ====== Solenoid (MOSFET low-side) ======
+const int solenoidPin = 17; // change if you want another GPIO (avoid strapping pins)
+bool solenoidState = false; // cached state
+unsigned long solenoidPulseEndMs = 0; // non-blocking pulse timeout (0 = no pulse scheduled)
+const unsigned long SOLENOID_UNLOCK_DELAY_MS = 500;
 
 // ====== Motion control state ======
 enum Mode { IDLE, LOWERING, PULLING };
@@ -72,10 +87,26 @@ void setServoUs(int us) {
   Serial.println(us);
 }
 
+void setSolenoid(bool on) {
+  digitalWrite(solenoidPin, on ? HIGH : LOW);
+  solenoidState = on;
+  if (!on) solenoidPulseEndMs = 0;
+  Serial.print("Solenoid -> ");
+  Serial.println(on ? "ON" : "OFF");
+}
+
+void pulseSolenoid(unsigned long ms) {
+  if (ms == 0) return;
+  setSolenoid(true);
+  solenoidPulseEndMs = millis() + ms;
+  Serial.printf("Solenoid pulsed for %lums\n", ms);
+}
+
 void stopMotor() {
   setServoUs(STOP_US);
   mode = IDLE;
   targetPulses = 0;
+  setSolenoid(false);
 }
 
 bool isTopPressed() {
@@ -93,6 +124,10 @@ long mmToPulses(float mm) {
 
 void startLowerMm(float mm) {
   if (mm <= 0) return;
+
+  // Unlock before lowering
+  setSolenoid(true);
+  delay(SOLENOID_UNLOCK_DELAY_MS);
 
   noInterrupts();
   pulseCount = 0;
@@ -115,15 +150,16 @@ void startLowerMm(float mm) {
 
 void startPullMm(float mm) {
   if (mm <= 0) return;
-
-  // If already at top, don't pull further
   if (isTopPressed()) {
     Serial.println("Already at TOP -> block pull");
     stopMotor();
     return;
   }
 
-  // clear topHit flag for a new pull command
+  // Unlock before pulling
+  setSolenoid(true);
+  delay(SOLENOID_UNLOCK_DELAY_MS);
+
   noInterrupts();
   topHit = false;
   pulseCount = 0;
@@ -217,6 +253,31 @@ void handleCommand(const String& cmdRaw, uint8_t clientNum) {
     return;
   }
 
+  // ---- Solenoid commands ----
+  // sol:on
+  // sol:off
+  // sol:pulse:MS  (example sol:pulse:150 => 150 ms)
+  if (cmd == "sol:on" || cmd == "sol:on\r" || cmd == "sol:on\n") {
+    setSolenoid(true);
+    ws.sendTXT(clientNum, "ok: solenoid on");
+    return;
+  }
+  if (cmd == "sol:off" || cmd == "sol:off\r" || cmd == "sol:off\n") {
+    setSolenoid(false);
+    ws.sendTXT(clientNum, "ok: solenoid off");
+    return;
+  }
+  if (cmd.startsWith("sol:pulse:")) {
+    long ms = cmd.substring(10).toInt();
+    if (ms <= 0) {
+      ws.sendTXT(clientNum, "err: invalid pulse ms");
+    } else {
+      pulseSolenoid((unsigned long)ms);
+      ws.sendTXT(clientNum, "ok: solenoid pulse " + String(ms) + "ms");
+    }
+    return;
+  }
+
   ws.sendTXT(clientNum, "err: unknown command");
 }
 
@@ -224,7 +285,7 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   if (type == WStype_CONNECTED) {
     IPAddress ip = ws.remoteIP(num);
     Serial.printf("WS client #%u connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
-    ws.sendTXT(num, "connected. cmds: lower:MM pull:MM stop zero");
+    ws.sendTXT(num, "connected. cmds: lower:MM pull:MM stop zero sol:on sol:off sol:pulse:MS");
   } else if (type == WStype_DISCONNECTED) {
     Serial.printf("WS client #%u disconnected -> stop\n", num);
     stopMotor(); // safety
@@ -235,24 +296,35 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   }
 }
 
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting WiFi");
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 40) {
-    delay(500);
-    Serial.print(".");
-    tries++;
+void connectWiFi(const char* ssid, const char* password,
+                 IPAddress local_IP, IPAddress gateway, IPAddress subnet) {
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  if (!WiFi.config(local_IP, gateway, subnet, dns1, dns2)) {
+    Serial.println("⚠️  Static IP config failed!");
   }
-  Serial.println();
+
+  WiFi.begin(ssid, password);
+  unsigned long startAttemptTime = millis();
+
+  // Try up to 10 seconds
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    Serial.print(".");
+    delay(500);
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("IP: ");
+    Serial.println("\nConnected!");
+    Serial.print("SSID: ");
+    Serial.println(ssid);
+    Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("WiFi failed (2.4GHz SSID?)");
+    Serial.println("\nConnection failed.");
   }
 }
+
 
 void setup() {
   Serial.begin(115200);  // Match Serial Monitor baud (74880 caused garbled output)
@@ -270,18 +342,42 @@ void setup() {
   pinMode(topLimitPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(topLimitPin), onTopLimit, FALLING); // pressed -> LOW
 
+  // Solenoid pin
+  pinMode(solenoidPin, OUTPUT);
+  digitalWrite(solenoidPin, LOW); // default OFF
+
   // WiFi + WS
-  connectWiFi();
+  // Try ANAFI first
+  connectWiFi(ssid1, password1, local_IP1, gateway1, subnet1);
+
+  // If not connected, try Itzsyboo
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi(ssid2, password2, local_IP2, gateway2, subnet2);
+  }
+
+  // Final status
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected successfully.");
+  } else {
+    Serial.println("Unable to connect to any WiFi.");
+  }
   ws.begin();
   ws.onEvent(onWsEvent);
 
   Serial.println("WS: ws://<ESP32_IP>:81");
-  Serial.println("Commands: lower:500  pull:200  stop  zero");
+  Serial.println("Commands: lower:500  pull:200  stop  zero  sol:on sol:off sol:pulse:MS");
   Serial.println("Top limit: stops pulling immediately when pressed.");
 }
 
 void loop() {
   ws.loop();
+
+  // handle solenoid pulse timeout (non-blocking)
+  if (solenoidPulseEndMs != 0 && millis() >= solenoidPulseEndMs) {
+    setSolenoid(false);
+    solenoidPulseEndMs = 0;
+    Serial.println("Solenoid pulse ended -> OFF");
+  }
 
   // Immediate stop if top limit is triggered while pulling
   if (mode == PULLING) {
