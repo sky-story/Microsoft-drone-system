@@ -19,13 +19,13 @@ volatile unsigned long lastPulseUs = 0;
 const unsigned long DEBOUNCE_US = 3000;
 
 // ====== Limit switch (Top) ======
-const int topLimitPin = 5;
+const int topLimitPin = 17;
 volatile bool topHit = false;
 volatile unsigned long lastTopUs = 0;
 const unsigned long TOP_DEBOUNCE_US = 5000;
 
 // ====== Solenoid ======
-const int solenoidPin = 17;
+const int solenoidPin = 5;
 bool solenoidState = false;
 unsigned long solenoidPulseEndMs = 0;
 const unsigned long SOLENOID_UNLOCK_DELAY_MS = 500;
